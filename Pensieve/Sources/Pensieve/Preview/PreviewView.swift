@@ -100,6 +100,7 @@ struct PreviewRepresentable: NSViewRepresentable {
 
   static func dismantleNSView(_ nsView: PreviewWebView, coordinator: Coordinator) {
     coordinator.detach()
+    nsView.invalidate()
   }
 
   private var currentRequest: PreviewRenderRequest {

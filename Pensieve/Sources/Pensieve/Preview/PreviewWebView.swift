@@ -15,7 +15,15 @@ import WebKit
 ///   • Routes activated `http(s)` / `mailto` links to `NSWorkspace` instead of
 ///     navigating the WebView itself.
 final class PreviewWebView: NSView {
-  private let webView: WKWebView
+  private let webView: WKWebView?
+  private let recoveryNotice = NSStackView()
+  private var loadGeneration: UInt64 = 0
+  private var updateInFlight = false
+  private var activeNavigation: WKNavigation?
+  private var navigationDocument: PreviewDocument?
+  private var automaticRecoveryCount = 0
+  private var isInvalidated = false
+  private(set) var isRecoveryPaused = false
   private var loadedIdentity: PreviewLoadIdentity?
   // Newest document handed to `load(document:)` — the recovery source when the
   // WebContent process dies or an in-place update fails under the same identity.
@@ -32,30 +40,58 @@ final class PreviewWebView: NSView {
   var fullPageLoadObserver: ((PreviewDocument) -> Void)?
   // Test seam: observes the in-place update script without a live WebContent process.
   var inPlaceUpdateObserver: ((String) -> Void)?
+  var updateScriptEvaluator: ((String, @escaping (Any?, Error?) -> Void) -> Void)?
 
-  override init(frame frameRect: NSRect) {
-    let config = WKWebViewConfiguration()
-    webView = WKWebView(frame: .zero, configuration: config)
-    webView.setValue(false, forKey: "drawsBackground")
-    webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
-    webView.setAccessibilityIdentifier("pensieve.preview")
+  override convenience init(frame frameRect: NSRect) {
+    self.init(frame: frameRect, createsWebContent: true)
+  }
+
+  /// State-machine tests run without starting a WebKit helper process.
+  init(frame frameRect: NSRect, createsWebContent: Bool) {
+    webView =
+      createsWebContent ? WKWebView(frame: .zero, configuration: WKWebViewConfiguration()) : nil
     super.init(frame: frameRect)
 
-    addSubview(webView)
-    webView.translatesAutoresizingMaskIntoConstraints = false
-    NSLayoutConstraint.activate([
-      webView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      webView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      webView.topAnchor.constraint(equalTo: topAnchor),
-      webView.bottomAnchor.constraint(equalTo: bottomAnchor),
-    ])
+    if let webView {
+      webView.setValue(false, forKey: "drawsBackground")
+      webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
+      webView.setAccessibilityIdentifier("pensieve.preview")
+      addSubview(webView)
+      webView.translatesAutoresizingMaskIntoConstraints = false
+      NSLayoutConstraint.activate([
+        webView.leadingAnchor.constraint(equalTo: leadingAnchor),
+        webView.trailingAnchor.constraint(equalTo: trailingAnchor),
+        webView.topAnchor.constraint(equalTo: topAnchor),
+        webView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      ])
+      webView.navigationDelegate = self
+    }
 
-    webView.navigationDelegate = self
+    let message = NSTextField(
+      wrappingLabelWithString:
+        "Preview paused after repeated failures. Your document is safe in the editor.")
+    message.alignment = .center
+    let reload = NSButton(title: "Reload Preview", target: self, action: #selector(resumePreview))
+    reload.setAccessibilityIdentifier("pensieve.preview.resume")
+    recoveryNotice.orientation = .vertical
+    recoveryNotice.spacing = 12
+    recoveryNotice.addArrangedSubview(message)
+    recoveryNotice.addArrangedSubview(reload)
+    recoveryNotice.isHidden = true
+    addSubview(recoveryNotice)
+    recoveryNotice.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      recoveryNotice.centerXAnchor.constraint(equalTo: centerXAnchor),
+      recoveryNotice.centerYAnchor.constraint(equalTo: centerYAnchor),
+      recoveryNotice.widthAnchor.constraint(lessThanOrEqualToConstant: 320),
+      recoveryNotice.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.9),
+    ])
     // The controller's own `scriptEvaluator` is the single injectable seam for
     // glass-script choreography (see PreviewThemeTests); here it always targets
     // the live WKWebView.
     titlebarGlassController.scriptEvaluator = { [weak self] script in
-      self?.webView.evaluateJavaScript(script, completionHandler: nil)
+      guard let self, !isInvalidated, !isRecoveryPaused else { return }
+      webView?.evaluateJavaScript(script, completionHandler: nil)
     }
   }
 
@@ -69,6 +105,7 @@ final class PreviewWebView: NSView {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    guard !isInvalidated else { return }
     titlebarGlassController.attach(to: window)
     // A re-parent hands us a window that knows nothing about the skin, and no
     // new document has to follow (the render dedupe may hold everything back
@@ -80,6 +117,7 @@ final class PreviewWebView: NSView {
 
   override func layout() {
     super.layout()
+    guard !isInvalidated else { return }
     titlebarGlassController.layoutDidChange()
   }
 
@@ -103,13 +141,16 @@ final class PreviewWebView: NSView {
   /// update the already-loaded article/style in place so scroll position and the
   /// WKWebView process stay stable while typing.
   func load(document: PreviewDocument) {
+    guard !isInvalidated else { return }
     lastDocument = document
     applyThemeChrome(for: document.skin)
     let identity = PreviewLoadIdentity(document: document)
     guard loadedIdentity == identity else {
+      resetRecovery()
       loadFullPage(document, identity: identity)
       return
     }
+    guard !isRecoveryPaused, !updateInFlight, activeNavigation == nil else { return }
     updateLoadedPage(document)
   }
 
@@ -145,11 +186,11 @@ final class PreviewWebView: NSView {
     if self.appearance?.name != appearance?.name {
       self.appearance = appearance
     }
-    if webView.appearance?.name != appearance?.name {
+    if let webView, webView.appearance?.name != appearance?.name {
       webView.appearance = appearance
     }
     let backing = WindowChromeRecipe.titlebarGlassBackingColor(for: skin)
-    if !WindowChromeRecipe.colorsMatch(webView.underPageBackgroundColor, backing) {
+    if let webView, !WindowChromeRecipe.colorsMatch(webView.underPageBackgroundColor, backing) {
       webView.underPageBackgroundColor = backing
     }
 
@@ -168,10 +209,58 @@ final class PreviewWebView: NSView {
   /// blank until the next edit happens to fail the in-place update path —
   /// a reader who never types would stare at a white panel forever.
   func handleWebContentProcessTermination() {
-    DebugTrace.log("preview web content process terminated — reloading last document")
-    loadedIdentity = nil
-    guard let document = lastDocument else { return }
+    recoverPreview()
+  }
+
+  /// Shared budget for process death AND failed script updates. Successful
+  /// navigations/typing do not reset it: a toxic page may die just after loading.
+  private func recoverPreview() {
+    guard !isInvalidated, !isRecoveryPaused, let document = lastDocument else { return }
+    guard automaticRecoveryCount < 2 else {
+      DebugTrace.log("preview recovery paused after repeated failures")
+      isRecoveryPaused = true
+      loadGeneration &+= 1
+      updateInFlight = false
+      activeNavigation = nil
+      navigationDocument = nil
+      webView?.stopLoading()
+      webView?.isHidden = true
+      recoveryNotice.isHidden = false
+      return
+    }
+    automaticRecoveryCount += 1
+    DebugTrace.log("preview automatic recovery \(automaticRecoveryCount)/2")
     loadFullPage(document, identity: PreviewLoadIdentity(document: document))
+  }
+
+  private func resetRecovery() {
+    automaticRecoveryCount = 0
+    isRecoveryPaused = false
+    recoveryNotice.isHidden = true
+    webView?.isHidden = false
+  }
+
+  @objc func resumePreview() {
+    guard !isInvalidated, let document = lastDocument else { return }
+    resetRecovery()
+    loadFullPage(document, identity: PreviewLoadIdentity(document: document))
+  }
+
+  /// SwiftUI dismantling is final for this sink. Late WebKit callbacks cannot
+  /// restart a detached preview or retain its latest document indefinitely.
+  func invalidate() {
+    guard !isInvalidated else { return }
+    isInvalidated = true
+    loadGeneration &+= 1
+    updateInFlight = false
+    activeNavigation = nil
+    navigationDocument = nil
+    lastDocument = nil
+    loadedIdentity = nil
+    appliedStyleHTML = nil
+    webView?.navigationDelegate = nil
+    webView?.stopLoading()
+    titlebarGlassController.invalidate()
   }
 
   // Scroll sync is deliberately ONE-WAY (editor → preview). The preview-side
@@ -180,7 +269,7 @@ final class PreviewWebView: NSView {
   // contract. Do not add a preview scroll observer without going through the
   // coordinator's latch semantics.
   private func scrollToScrollSyncPosition(_ position: ScrollSyncPosition) {
-    guard loadedIdentity != nil else { return }
+    guard !isInvalidated, !isRecoveryPaused, loadedIdentity != nil else { return }
     let progress = position.progress
     let script = """
       (function() {
@@ -190,11 +279,14 @@ final class PreviewWebView: NSView {
         return true;
       })();
       """
-    webView.evaluateJavaScript(script, completionHandler: nil)
+    webView?.evaluateJavaScript(script, completionHandler: nil)
   }
 
   private func loadFullPage(_ document: PreviewDocument, identity: PreviewLoadIdentity) {
-    webView.loadHTMLString(document.html, baseURL: document.baseURL)
+    loadGeneration &+= 1
+    updateInFlight = false
+    navigationDocument = document
+    activeNavigation = webView?.loadHTMLString(document.html, baseURL: document.baseURL)
     loadedIdentity = identity
     // The full HTML embeds this stylesheet inline, so the page carries it
     // already — the next same-identity edit has nothing to re-ship.
@@ -204,6 +296,8 @@ final class PreviewWebView: NSView {
   }
 
   private func updateLoadedPage(_ document: PreviewDocument) {
+    updateInFlight = true
+    let generation = loadGeneration
     let script = """
       (function() {
         const previousX = window.scrollX || 0;
@@ -254,8 +348,13 @@ final class PreviewWebView: NSView {
       })();
       """
     inPlaceUpdateObserver?(script)
-    webView.evaluateJavaScript(script) { [weak self, document] result, error in
-      self?.handleUpdateScriptResult(result, error: error, for: document)
+    let completion: (Any?, Error?) -> Void = { [weak self, document] result, error in
+      self?.handleUpdateScriptResult(result, error: error, for: document, generation: generation)
+    }
+    if let updateScriptEvaluator {
+      updateScriptEvaluator(script, completion)
+    } else {
+      webView?.evaluateJavaScript(script, completionHandler: completion)
     }
   }
 
@@ -293,12 +392,20 @@ final class PreviewWebView: NSView {
   /// unconditional reload here would overwrite a newer page with stale content.
   /// `lastDocument` (not the failed snapshot) is reloaded so same-identity
   /// edits that raced past the failure are not rolled back.
-  func handleUpdateScriptResult(_ result: Any?, error: Error?, for document: PreviewDocument) {
-    guard error != nil || (result as? Bool) != true else { return }
+  func handleUpdateScriptResult(
+    _ result: Any?, error: Error?, for document: PreviewDocument, generation: UInt64? = nil
+  ) {
+    guard !isInvalidated, !isRecoveryPaused else { return }
+    if let generation, generation != loadGeneration { return }
     guard loadedIdentity == PreviewLoadIdentity(document: document), let current = lastDocument
     else { return }
-    DebugTrace.log("preview in-place update failed — falling back to full page load")
-    loadFullPage(current, identity: PreviewLoadIdentity(document: current))
+    updateInFlight = false
+    if error != nil || (result as? Bool) != true {
+      recoverPreview()
+    } else if current != document {
+      // While WebKit was busy, load(document:) kept only the newest successor.
+      updateLoadedPage(current)
+    }
   }
 
   /// Assembled `@font-face` payload per skin. The bundle cannot change at
@@ -1508,7 +1615,31 @@ extension PreviewWebView: WKNavigationDelegate {
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    guard !isInvalidated, !isRecoveryPaused, activeNavigation === navigation else { return }
+    activeNavigation = nil
+    let loadedDocument = navigationDocument
+    navigationDocument = nil
     titlebarGlassController.navigationDidFinish()
+    if let document = lastDocument, document != loadedDocument, !updateInFlight {
+      updateLoadedPage(document)
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    handleNavigationFailure(navigation)
+  }
+
+  func webView(
+    _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+    withError error: Error
+  ) {
+    handleNavigationFailure(navigation)
+  }
+
+  private func handleNavigationFailure(_ navigation: WKNavigation?) {
+    guard !isInvalidated, !isRecoveryPaused, activeNavigation === navigation else { return }
+    activeNavigation = nil
+    recoverPreview()
   }
 
   func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
