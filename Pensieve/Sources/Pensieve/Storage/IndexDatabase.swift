@@ -2777,7 +2777,8 @@ final class IndexDatabase {
     pool: DatabasePool
   ) throws -> [WorkspaceSearchResult] {
     let documentsByPath = Dictionary(
-      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
+      documents.map { ($0.url.standardizedFileURL.path, $0) },
+      uniquingKeysWith: { first, _ in first }
     )
     guard !documentsByPath.isEmpty else { return [] }
 
@@ -2826,7 +2827,8 @@ final class IndexDatabase {
     didOpenRead: (@Sendable () -> Void)? = nil
   ) throws -> [WorkspaceBacklinkResult] {
     let documentsByPath = Dictionary(
-      uniqueKeysWithValues: documents.map { ($0.url.standardizedFileURL.path, $0) }
+      documents.map { ($0.url.standardizedFileURL.path, $0) },
+      uniquingKeysWith: { first, _ in first }
     )
     guard !documentsByPath.isEmpty else { return [] }
 
@@ -2861,12 +2863,14 @@ final class IndexDatabase {
       )
     }
 
+    var seenDocumentIDs = Set<DocumentRef.ID>()
     return Array(
       results
         .sorted { lhs, rhs in
           if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
           return lhs.displayPath.localizedStandardCompare(rhs.displayPath) == .orderedAscending
         }
+        .filter { seenDocumentIDs.insert($0.id).inserted }
         .prefix(limit)
     )
   }

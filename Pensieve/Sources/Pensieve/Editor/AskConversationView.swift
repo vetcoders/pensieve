@@ -181,7 +181,8 @@ final class AskConversationModel: ObservableObject {
       // The display list follows the thread's order; re-added turns
       // (scope switch) and appends must not scramble it.
       let positions = Dictionary(
-        uniqueKeysWithValues: newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) })
+        newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) },
+        uniquingKeysWith: { first, _ in first })
       turns.sort { (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max) }
     }
     // Eager parse is due only for the window the user can actually see.

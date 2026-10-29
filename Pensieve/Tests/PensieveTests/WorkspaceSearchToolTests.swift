@@ -360,4 +360,66 @@ final class WorkspaceSearchToolTests: XCTestCase {
     XCTAssertEqual(implicit.count, 50)
     XCTAssertEqual(implicit.map(\.document.id), explicit.map(\.document.id))
   }
+
+  func testSearchAndBacklinksHandleDuplicateDocumentPathsFromNestedRoots() async throws {
+    let harness = try makeHarness()
+    defer { harness.cleanup() }
+    let outerRoot = try makeRoot(in: harness.base, name: "outer")
+    let nestedRoot = outerRoot.appendingPathComponent("nested", isDirectory: true)
+      .standardizedFileURL
+    try FileManager.default.createDirectory(at: nestedRoot, withIntermediateDirectories: true)
+
+    let targetURL = nestedRoot.appendingPathComponent("target.md").standardizedFileURL
+    try "# Target\nalpha beta target note".write(to: targetURL, atomically: true, encoding: .utf8)
+    let sourceURL = nestedRoot.appendingPathComponent("source.md").standardizedFileURL
+    try "# Source\nLinks to [[target]] with alpha beta".write(
+      to: sourceURL, atomically: true, encoding: .utf8)
+
+    let outerTarget = DocumentRef(
+      id: targetURL, rootURL: outerRoot, relativePath: "nested/target.md")
+    let innerTarget = DocumentRef(
+      id: targetURL, rootURL: nestedRoot, relativePath: "target.md")
+    let outerSource = DocumentRef(
+      id: sourceURL, rootURL: outerRoot, relativePath: "nested/source.md")
+    let innerSource = DocumentRef(
+      id: sourceURL, rootURL: nestedRoot, relativePath: "source.md")
+    let duplicateDocuments = [outerTarget, innerTarget, outerSource, innerSource]
+
+    let nestedIdentity = WorkspaceIdentity.make(
+      roots: [outerRoot, nestedRoot], bookmarkData: nil)
+    await harness.database.upsertWorkspace(
+      identity: nestedIdentity,
+      roots: [outerRoot, nestedRoot],
+      documents: duplicateDocuments
+    )
+
+    let syncSearch = harness.database.search(query: "alpha beta", documents: duplicateDocuments)
+    XCTAssertEqual(Set(syncSearch.map(\.id)), [targetURL, sourceURL])
+    XCTAssertEqual(syncSearch.count, 2)
+
+    let asyncSearch = await harness.database.searchInBackground(
+      query: "alpha beta", documents: duplicateDocuments)
+    XCTAssertEqual(Set(asyncSearch.map(\.id)), [targetURL, sourceURL])
+    XCTAssertEqual(asyncSearch.count, 2)
+
+    let toolPayload = try decode(
+      await WorkspaceSearchTool.workspaceSearchInBackground(
+        query: "alpha beta",
+        documents: duplicateDocuments,
+        database: harness.database
+      )
+    )
+    XCTAssertEqual(toolPayload.count, 2)
+    XCTAssertEqual(Set(toolPayload.matches.map(\.path)), [targetURL.path, sourceURL.path])
+
+    let syncBacklinks = harness.database.backlinks(
+      to: outerTarget, documents: duplicateDocuments)
+    XCTAssertEqual(syncBacklinks.map(\.id), [sourceURL])
+    XCTAssertEqual(syncBacklinks.first?.sourceDocument, outerSource)
+
+    let asyncBacklinks = await harness.database.backlinksInBackground(
+      to: outerTarget, documents: duplicateDocuments)
+    XCTAssertEqual(asyncBacklinks.map(\.id), [sourceURL])
+    XCTAssertEqual(asyncBacklinks.first?.sourceDocument, outerSource)
+  }
 }

@@ -65,6 +65,47 @@ final class WorkspaceAskThreadTests: XCTestCase {
       try String(contentsOf: document.url, encoding: .utf8), "alpha beta shared decision")
   }
 
+  func testWorkspaceThreadSearchHandlesNestedRootsWithDuplicateDocumentPaths() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let nestedRoot = fixture.root.appendingPathComponent("nested", isDirectory: true)
+      .standardizedFileURL
+    try FileManager.default.createDirectory(at: nestedRoot, withIntermediateDirectories: true)
+    let fileURL = nestedRoot.appendingPathComponent("decision.md").standardizedFileURL
+    try "alpha beta nested decision".write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let outerRef = DocumentRef(
+      id: fileURL, rootURL: fixture.root, relativePath: "nested/decision.md")
+    let innerRef = DocumentRef(
+      id: fileURL, rootURL: nestedRoot, relativePath: "decision.md")
+    let nestedIdentity = WorkspaceIdentity.make(
+      roots: [fixture.root, nestedRoot], bookmarkData: nil)
+
+    let database = IndexDatabase(databaseURL: fixture.base.appendingPathComponent("index.db"))
+    database.open()
+    await database.upsertWorkspace(
+      identity: nestedIdentity,
+      roots: [fixture.root, nestedRoot],
+      documents: [outerRef, innerRef]
+    )
+
+    let agent = ToolCallingAgent()
+    let thread = WorkspaceAskThread(identity: nestedIdentity, makeAgent: { agent })
+    let host = await thread.makeHost(documents: [outerRef, innerRef], database: database)
+    XCTAssertTrue(thread.send(text: "alpha beta", host: host, provider: .apiKey("test-key")))
+    try await waitUntil { !thread.isStreaming }
+
+    let json = try XCTUnwrap(agent.searchResult.withLock { $0 })
+    let payload = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    let matches = try XCTUnwrap(payload["matches"] as? [[String: Any]])
+    XCTAssertEqual(matches.count, 1)
+    XCTAssertEqual(matches.first?["path"] as? String, fileURL.path)
+    XCTAssertEqual(agent.readResult.withLock { $0 }, "alpha beta nested decision")
+    XCTAssertEqual(thread.turns.last?.text, "Found the workspace decision.")
+    XCTAssertNil(thread.lastError)
+  }
+
   func testWorkspaceOpensLiveBufferEditsWithUndoAndDoesNotWriteDisk() async throws {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
