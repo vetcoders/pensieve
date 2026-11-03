@@ -104,16 +104,17 @@ host=ffi-freshness-fixture
 EOF
 }
 
-# run_check [CODESCRIBE_ROOT|-] [VISTA_KERNEL_ROOT|-] [FFI_CHECK_STRICT]
+# run_check [CODESCRIBE_ROOT|-] [VISTA_KERNEL_ROOT|-] [FFI_CHECK_STRICT] [FFI_PROFILE]
 # `-` or omitted means unset. Sets CHECK_STATUS, CHECK_OUT.
 run_check() {
     local env_codescribe="${1:-}"
     local env_vista="${2:-}"
     local env_strict="${3:-}"
+    local env_profile="${4:-}"
     local env_args
     CHECK_OUT=""
     CHECK_STATUS=0
-    env_args=(env -u VISTA_KERNEL_ROOT -u CODESCRIBE_ROOT -u FFI_CHECK_STRICT
+    env_args=(env -u VISTA_KERNEL_ROOT -u CODESCRIBE_ROOT -u FFI_CHECK_STRICT -u FFI_PROFILE
         PENSIEVE_ROOT="$PENSIEVE_ROOT")
     if [[ -n "$env_codescribe" && "$env_codescribe" != "-" ]]; then
         env_args+=(CODESCRIBE_ROOT="$env_codescribe")
@@ -123,6 +124,9 @@ run_check() {
     fi
     if [[ -n "$env_strict" ]]; then
         env_args+=(FFI_CHECK_STRICT="$env_strict")
+    fi
+    if [[ -n "$env_profile" ]]; then
+        env_args+=(FFI_PROFILE="$env_profile")
     fi
     env_args+=(/bin/bash "$CHECK")
     CHECK_OUT="$("${env_args[@]}" 2>&1)" || CHECK_STATUS=$?
@@ -173,6 +177,23 @@ run_check
 assert_exit "matching codescribe pin is exit 0" 0
 assert_contains "matching codescribe pin prints HEAD" "$HEAD_A"
 assert_not_contains "matching pin does not mention missing vista" "vista-kernel checkout not found"
+
+# The caller's build profile must not select a different synthetic payload.
+FFI_PROFILE=release run_check
+assert_exit "caller release profile does not change the default fixture" 0
+assert_contains "default fixture stays debug under an inherited release profile" "$HEAD_A"
+
+# Explicit profile cases use different bytes so checking the wrong file fails.
+write_dylib "$PENSIEVE_ROOT/Vendor/codescribe-ffi/release/libcodescribe_ffi.dylib" "release-blob-a"
+SHA_RELEASE="$(dylib_sha "$PENSIEVE_ROOT/Vendor/codescribe-ffi/release/libcodescribe_ffi.dylib")"
+write_codescribe_provenance "$HEAD_A" "$SHA_RELEASE" release
+run_check "-" "-" "" release
+assert_exit "explicit release fixture is exit 0" 0
+assert_contains "explicit release fixture verifies its own payload" "$HEAD_A"
+run_check "-" "-" "1" debug
+assert_exit "wrong profile payload fails strict verification" 1
+assert_contains "wrong profile payload reports the checksum mismatch" "dylib sha256"
+write_codescribe_provenance "$HEAD_A" "$SHA_A" debug
 
 # ── C. stale HEAD ─────────────────────────────────────────────────────────
 git_commit_tree "$CODESCRIBE_DEFAULT" "donor-b"
