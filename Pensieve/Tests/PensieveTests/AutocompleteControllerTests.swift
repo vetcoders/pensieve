@@ -589,8 +589,12 @@ final class AutocompleteControllerTests: XCTestCase {
     XCTAssertEqual(attempts.value, 1)
 
     controller.cancel()
+    XCTAssertNil(controller.lastError)
     controller.textDidChange(prefix: "hello again")
-    await waitUntil { attempts.value == 2 }
+    await waitUntil {
+      attempts.value == 2
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
+    }
 
     XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
   }
