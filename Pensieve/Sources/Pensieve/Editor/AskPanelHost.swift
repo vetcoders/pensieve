@@ -11,9 +11,18 @@ import SwiftUI
 @MainActor
 final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
   /// One owner for the entire application, including restored native tabs.
-  static let shared = AskPanelController(defaults: .standard)
-  let documentThreadID = UUID()
-  let threads: DocumentAskThreadStore
+  static let shared: AskPanelController = {
+    let threads: AskThreadStore
+    do {
+      threads = AskThreadStore(history: try AskHistoryStore())
+    } catch {
+      threads = AskThreadStore()
+      threads.reportHistoryError(error)
+    }
+    return AskPanelController(defaults: .standard, threads: threads)
+  }()
+  @Published private(set) var activeThreadID = UUID()
+  let threads: AskThreadStore
   private let defaults: UserDefaults?
   private var rememberedMode: AskPresentationMode = .docked
   private var contentSize: CGSize = .zero
@@ -52,7 +61,7 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
   init(
     presentation: AskPresentationState = .expandedDefault,
     defaults: UserDefaults? = nil,
-    threads: DocumentAskThreadStore? = nil,
+    threads: AskThreadStore? = nil,
     panelFactory: (@MainActor () -> NSPanel)? = nil,
     presentPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderFront(nil) },
     dismissPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderOut(nil) },
@@ -60,7 +69,7 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
     onPresentationChange: (@MainActor (AskPresentationState) -> Void)? = nil
   ) {
     self.defaults = defaults
-    self.threads = threads ?? DocumentAskThreadStore()
+    self.threads = threads ?? AskThreadStore()
     var restored = presentation
     if let defaults {
       restored.isExpanded = defaults.object(forKey: "pensieve.ask.expanded") as? Bool ?? true
@@ -82,6 +91,65 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
     self.panelIsVisible = panelIsVisible
     self.onPresentationChange = onPresentationChange
     super.init()
+    if let raw = defaults?.string(forKey: "pensieve.ask.activeThread"),
+      let id = UUID(uuidString: raw),
+      let record = self.threads.historyRecords.first(where: { $0.id == id })
+    {
+      self.threads.restore(record)
+      activeThreadID = id
+    }
+  }
+
+  @discardableResult
+  func ensureThread(context: AskContext) -> AskThread {
+    let thread = threads.thread(for: activeThreadID, context: context)
+    defaults?.set(thread.id.uuidString, forKey: "pensieve.ask.activeThread")
+    return thread
+  }
+
+  /// Context changes mint a thread; changing editor tabs never mutates it.
+  func newThread(context: AskContext) {
+    threads.existingThread(for: activeThreadID)?.cancel()
+    activateThread(threads.newThread(context: context).id)
+  }
+
+  func activateThread(_ id: UUID) {
+    if threads.existingThread(for: id) == nil,
+      let record = threads.historyRecords.first(where: { $0.id == id })
+    {
+      threads.restore(record)
+    }
+    guard threads.existingThread(for: id) != nil else { return }
+    if id != activeThreadID { threads.existingThread(for: activeThreadID)?.cancel() }
+    activeThreadID = id
+    defaults?.set(id.uuidString, forKey: "pensieve.ask.activeThread")
+  }
+
+  /// Both menu and AppKit quit paths must preserve the conversation before
+  /// document consent can retire any other unsaved work. A failed write vetoes
+  /// termination while the transcript and draft are still available in memory.
+  func prepareForTermination(
+    confirmUnsavedHistoryQuit: @MainActor (String) -> Bool = { _ in false },
+    resolveDocuments: @MainActor () -> NSApplication.TerminateReply
+  ) -> NSApplication.TerminateReply {
+    if !threads.cancelAll() {
+      let message = threads.historyError ?? "Ask history could not be saved."
+      guard confirmUnsavedHistoryQuit(message) else {
+        presentation.mode = .docked
+        return .terminateCancel
+      }
+    }
+    return resolveDocuments()
+  }
+
+  static func confirmQuitWithoutSavedHistory(_ message: String) -> Bool {
+    let alert = NSAlert()
+    alert.messageText = "Ask history could not be saved"
+    alert.informativeText =
+      message + "\nQuit without saving the latest Ask conversations and drafts?"
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Quit Without Saving Ask History")
+    return alert.runModal() == .alertSecondButtonReturn
   }
 
   var isVisible: Bool { presentation.mode != .hidden }
@@ -200,6 +268,7 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   func handleOwnerWindowWillClose() {
     isOwnerClosed = true
+    threads.flushHistory()
     if let panel {
       dismissPanel(panel)
     }

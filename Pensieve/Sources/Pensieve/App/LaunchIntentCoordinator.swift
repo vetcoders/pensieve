@@ -528,7 +528,11 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
   /// is what the 2026-07-29 attempt hit.
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     MainActor.assumeIsolated {
-      DocumentWindowRegistry.shared.resolveTerminationRequest()
+      AskPanelController.shared.prepareForTermination(
+        confirmUnsavedHistoryQuit: AskPanelController.confirmQuitWithoutSavedHistory
+      ) {
+        (terminationWindowRegistryOverride ?? .shared).resolveTerminationRequest()
+      }
     }
   }
 
@@ -540,6 +544,7 @@ final class PensieveAppDelegate: NSObject, NSApplicationDelegate {
       // user bytes, persist the working set, drain the index and checkpoint.
       // Keeping those roles separate avoids both an unvetoable quit and a
       // duplicate final flush. See `TerminationSequence`.
+      AskPanelController.shared.threads.cancelAll()
       TerminationSequence(
         registry: terminationWindowRegistryOverride ?? .shared,
         indexDatabase: terminationIndexDatabaseOverride ?? .shared,

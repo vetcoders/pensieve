@@ -19,7 +19,7 @@ final class WindowErrorChromeRig {
   let appState: AppState
   let controller: AppController
   let themeManager: ThemeManager
-  let askThreads: DocumentAskThreadStore
+  let askThreads: AskThreadStore
   let askPanelController: AskPanelController
   let commandSurface: CommandSurfaceContext
   let window: NSWindow

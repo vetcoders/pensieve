@@ -48,26 +48,15 @@ extension AskAttachmentError: LocalizedError {
   }
 }
 
-/// Attachment-capable Ask stream seam over the scoped FFI entrypoints. The
-/// plain `CodescribeAgentStreaming` protocol stays untouched so existing
-/// engines and test doubles keep compiling; a thread sending attachments
-/// requires this seam and fails explicitly when the engine lacks it.
-protocol CodescribeAgentAttachmentStreaming: CodescribeAgentStreaming {
-  func streamDocumentWithAttachments(
-    text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost,
-    provider: CsDocumentProvider?, listener: CsAgentListener
-  ) async throws -> String
-}
-
-/// Workspace twin of `CodescribeAgentAttachmentStreaming`.
-protocol WorkspaceAgentAttachmentStreaming: WorkspaceAgentStreaming {
+/// Attachment capability over Ask's single workspace streaming seam.
+protocol AskAgentAttachmentStreaming: AskAgentStreaming {
   func streamWorkspaceWithAttachments(
     text: String, threadId: String, attachments: [CsAttachment], workspace: CsDocumentToolHost,
     provider: CsDocumentProvider?, listener: CsAgentListener
   ) async throws -> String
 }
 
-extension CodescribeAgent: CodescribeAgentAttachmentStreaming, WorkspaceAgentAttachmentStreaming {}
+extension CodescribeAgent: AskAgentAttachmentStreaming {}
 
 /// The pending attachment set of one Ask thread, plus the Pensieve-owned
 /// staging area for clipboard images. Staged copies live under the app's own
