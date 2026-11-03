@@ -1,7 +1,7 @@
 codescribe-root=/Volumes/vc-workspace/vetcoders/codescribe
-codescribe-head=a693b6da138c76900472b854d96440669b4b1e4b
-codescribe-describe=v0.17.0-2753-ga693b6da1
-ffi-profile=debug
-dylib-sha256=30c47e5e78a671f038858bfc0b14d1246dc8a6c13783615afdee1e7c108a6bb9
-built-at=2026-11-03T14:15:17Z
+codescribe-head=63d2095a3d00ee9583fbeb24bfd1150e1d49b738
+codescribe-describe=v0.17.0-2762-g63d2095a3
+ffi-profile=release
+dylib-sha256=12222a7860354c2f2c2fd2090bbe2ab0c18463d3d203b0d16e13c9d907ebd483
+built-at=2026-11-03T19:56:37Z
 host=dragon
