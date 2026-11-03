@@ -5,7 +5,100 @@ All notable changes to Pensieve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-04
+
+### Added
+
+- Native AppKit floating panel for Ask: detached Ask floats in its own
+  borderless, resizable AppKit panel (`TaflaPanel`) sharing the presentation
+  recipe with transcription. Includes an Always-on-Top (AoT) toggle (`.floating`
+  vs `.normal`), native AppKit window dragging (`performDrag(with:)`), and
+  seamless dock/float transitions backed by a single persistent hosting view
+  preserving draft, conversation state, attachments, and active streams.
+- One Ask conversation surface for both scopes: a resizable dock that
+  remembers its height, an optional in-window float, and a native Markdown
+  transcript (headings, lists, quotes, tasks, links, code and tables) with
+  role labels, full-source selection and copy, follow-tail scrolling and a
+  bounded history window. Streaming replies parse off the main thread,
+  coalesced to at most ten updates a second, and long answers render in
+  bounded block pages. Scope, provider and readiness share the single header.
+- Image attachments in Ask: file picker, image/file paste and drag/drop with
+  removable preview chips. Clipboard images stage in Pensieve-owned support
+  storage; sends validate off the main thread, join the exact images to their
+  turn, and keep the draft and attachments on failure or Stop. Pasting an
+  image never inserts bytes or marker text into the draft or document.
+- Keyless local Ask: a genuinely loopback Responses endpoint (localhost,
+  127.0.0.1 or ::1 over HTTP/S) with a configured model is ready without an
+  API key, in both document and workspace scopes. Remote endpoints keep the
+  API-key and account sign-in rules.
+- Workspace Ask can open or activate an indexed document tab and use the
+  embedded engine's document tools on its live buffer, including unsaved text
+  and native Undo/Redo. Opening returns a receipt, not the entire document.
+- Read the end of a document directly and page through literal search results.
+
+### Changed
+
+- Submit Document Ask immediately with Enter or Ask. Remove the extra document
+  access confirmation and whole-document character counting at submission.
+- Ask retrieves relevant excerpts on demand instead of requiring an initial
+  full-document scan. Workspace conversation scope follows newly opened tabs.
+- The fixed 96/120 pt plain-text transcript and fixed-height Ask panels are
+  replaced by the shared surface above; the status bar, sidebar and editor
+  invariants are unchanged, and Hide remains distinct from Stop.
+
+## [0.6.0] - 2026-09-29
+
+### Added
+
+- **Ask can read, search, and edit the current document**, including unsaved
+  changes. Its document tools retrieve text as needed and apply edits through
+  the editor, with native Undo/Redo and the usual recovery and auto-save rules.
+- Show tool activity while Ask works. Stop cancels the engine's active turn;
+  switching documents or closing the document window revokes its access.
+
+### Changed
+
+- **Pensieve owns its AI engine configuration, credentials, and conversation
+  history.** The engine ships inside Pensieve; using Ask does not require the
+  Codescribe application, its account setup, or a running companion process.
+- Send each Ask instruction as one agent turn. Long documents are read in
+  bounded portions on demand instead of becoming separate page conversations
+  whose earlier answers were discarded.
+
+### Fixed
+
+- Keep ordinary typing and line-break highlighting scoped to the actual text
+  edit. TextKit's wider formatting invalidation no longer incorrectly triggers
+  a whole-document repaint when a nearby code fence has not changed. This
+  removes a reproduced cause of viewport jumps in editor and split views while
+  preserving native caret scrolling.
+- Replace expensive fenced-code pattern matching with a linear scan, preventing
+  pathological highlighting stalls on large or unfinished fenced blocks.
+- Parse Markdown previews off the main thread, coalesce pending work, and reject
+  stale results so rapid edits cannot build an unbounded rendering backlog or
+  display an older document revision.
+- Release completed workspace-validation tasks and their retained scan results.
+- Reject unfinished AI Responses before replacing document text, and preserve
+  every output text part of a completed response.
+- Reject Ask edits based on stale document content or ambiguous replacement
+  text. Ignore late events from cancelled turns so they cannot restart a stopped
+  task or update the wrong document session.
+
+### Release engineering
+
+- Pin the embedded engine and generated bindings together, using the same
+  optimized engine payload in debug and release builds.
+- Extend isolated runtime credential cleanup to Pensieve's agent account.
+
+### Known limitations
+
+- Installed-app verification of editor scroll stability and Ask's live provider
+  workflow remains pending; automated regression tests do not establish that
+  all reported scrolling, heating, or responsiveness issues are resolved.
+- Dictation remains unqualified for release. Outstanding upstream ASR and Apple
+  streaming test failures require separate resolution.
+- Whole-document Rewrite still has no input chunking or context-budget
+  preflight. Ask's bounded document reads do not remove that separate limit.
 
 ## [0.5.0] - Unreleased
 

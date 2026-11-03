@@ -1,7 +1,7 @@
-codescribe-root=/Volumes/vc-workspace/vetcoders/codescribe
-codescribe-head=UNSTAMPED
-codescribe-describe=unpinned-vendored-blob
+codescribe-root=/Users/polyversai/.vibecrafted/worktrees/vetcoders/codescribe/2026_1003/pensieve-ask-rich-attachments
+codescribe-head=1c342f19beb122b04ea8d44b78447e8276dd6135
+codescribe-describe=baseline/transcription-1292-91-g1c342f19
 ffi-profile=release
-dylib-sha256=57fe14b0737169e63da4b14bf0fd4494371d74e09cad310a5a7a7a5e2ed71d9c
-built-at=2026-09-19T00:00:00Z
-host=unpinned-import
+dylib-sha256=023bd9e9f539d8bd0c272df5e7f6a9a560aa80637e0c7908f36be987c0154970
+built-at=2026-10-03T13:13:11Z
+host=dragon

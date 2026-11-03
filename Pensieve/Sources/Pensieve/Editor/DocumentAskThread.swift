@@ -2,7 +2,7 @@ import CodescribeBridge
 import Combine
 import Foundation
 
-/// One codescribe Ask conversation, keyed by the document's birth UUID — never
+/// One Pensieve Ask conversation, keyed by the document's birth UUID — never
 /// by path. Save As / rename keep talking to the same thread; a new untitled
 /// buffer or a different file mints a new one.
 @MainActor
@@ -11,16 +11,31 @@ final class DocumentAskThread: ObservableObject, Identifiable {
 
   @Published private(set) var turns: [AskTurn] = []
   @Published private(set) var phase: AskThreadPhase = .idle
-  @Published private(set) var preflight: AskPreflight?
   @Published private(set) var lastError: String?
   @Published var draft: String = ""
 
+  /// Pending image attachments for the next send. Staged clipboard copies are
+  /// Pensieve-owned; external files are only referenced.
+  let attachmentStore: AskAttachmentStore
+
   private let agent: any CodescribeAgentStreaming
   private var inFlightTask: Task<Void, Never>?
+  /// The most recently started send task, retained past cancellation so a
+  /// test can deterministically observe its completion instead of yielding
+  /// and hoping a suspended validator already resumed.
+  private(set) var lastSendTask: Task<Void, Never>?
+  private var activeHost: DocumentToolHost?
+  private var generation: UUID?
+  private var inFlightPrompt: String?
+  @Published private(set) var activity: String?
 
-  init(id: UUID, agent: any CodescribeAgentStreaming) {
+  init(
+    id: UUID, agent: any CodescribeAgentStreaming,
+    attachmentStore: AskAttachmentStore? = nil
+  ) {
     self.id = id
     self.agent = agent
+    self.attachmentStore = attachmentStore ?? AskAttachmentStore()
   }
 
   var isStreaming: Bool {
@@ -38,52 +53,17 @@ final class DocumentAskThread: ObservableObject, Identifiable {
     turns.append(AskTurn(role: .dictation, text: utterance))
   }
 
-  /// Computes char counts and pages. Does not send. The user must confirm.
+  /// Sending authorizes the live document tools. No document is inspected or
+  /// added to the prompt here; the agent requests relevant fragments later.
   @discardableResult
-  func prepareSend(document: String, provider: AskProvider) -> AskPreflight? {
-    lastError = nil
-    guard AskReadiness.isReady(provider) else {
+  func send(
+    provider: AskProvider, host: DocumentToolHost,
+    configuration: CsDocumentProvider? = nil
+  ) -> Bool {
+    guard !isStreaming else { return false }
+    guard AskReadiness.isReady(provider, context: AskEndpointContext(configuration: configuration))
+    else {
       lastError = AskReadiness.notReadyMessage(for: provider)
-      preflight = nil
-      phase = .idle
-      return nil
-    }
-    let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !prompt.isEmpty else {
-      lastError = "Write a question before sending."
-      preflight = nil
-      phase = .idle
-      return nil
-    }
-    let prepared = AskPreflight.make(prompt: prompt, document: document)
-    preflight = prepared
-    phase = .awaitingConfirmation
-    return prepared
-  }
-
-  /// Grill contract: send is blocked until the user has confirmed the preflight.
-  @discardableResult
-  func sendWithoutConfirm(document: String, provider: AskProvider) -> Bool {
-    lastError = "Confirm the character counts before sending."
-    return false
-  }
-
-  func cancelPreflight() {
-    preflight = nil
-    lastError = nil
-    if phase == .awaitingConfirmation {
-      phase = .idle
-    }
-  }
-
-  @discardableResult
-  func confirmAndSend(document: String, provider: AskProvider) -> Bool {
-    guard AskReadiness.isReady(provider) else {
-      lastError = AskReadiness.notReadyMessage(for: provider)
-      return false
-    }
-    guard phase == .awaitingConfirmation, let prepared = preflight, !prepared.pages.isEmpty else {
-      lastError = "Confirm the character counts before sending."
       return false
     }
     let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -91,103 +71,150 @@ final class DocumentAskThread: ObservableObject, Identifiable {
       lastError = "Write a question before sending."
       return false
     }
-    startStreaming(prompt: prompt, pages: prepared.pages)
+    startStreaming(
+      prompt: prompt, attachments: attachmentStore.attachments, host: host,
+      configuration: configuration)
     return true
   }
 
-  private func startStreaming(prompt: String, pages: [String]) {
+  func cancel() {
+    guard isStreaming else { return }
+    activeHost?.invalidate()
+    activeHost = nil
+    generation = nil
+    _ = agent.cancelTurn(threadId: id.uuidString.lowercased())
     inFlightTask?.cancel()
-    turns.append(AskTurn(role: .user, text: prompt))
+    inFlightTask = nil
+    for index in turns.indices { turns[index].isStreaming = false }
+    // A stopped turn keeps the user's input: restore the prompt and keep the
+    // pending attachments, unless a newer draft already replaced it.
+    if let prompt = inFlightPrompt, draft.isEmpty { draft = prompt }
+    inFlightPrompt = nil
+    activity = "Stopped"
+    phase = .idle
+  }
+
+  private func startStreaming(
+    prompt: String, attachments: [AskAttachment], host: DocumentToolHost,
+    configuration: CsDocumentProvider?
+  ) {
+    let token = UUID()
+    generation = token
+    activeHost = host
+    inFlightPrompt = prompt
+    turns.append(
+      AskTurn(role: .user, text: prompt, attachmentIDs: attachments.map(\.id)))
     let assistantID = UUID()
     turns.append(AskTurn(id: assistantID, role: .assistant, text: "", isStreaming: true))
     phase = .streaming
+    activity = "Working…"
     draft = ""
     lastError = nil
-
     let threadID = id.uuidString.lowercased()
     let agent = self.agent
-    inFlightTask = Task { [weak self] in
+    let attachmentStore = self.attachmentStore
+    let sendTask = Task { [weak self] in
       let listener = AskStreamListener()
-      listener.onDelta = { [weak self] delta in
-        Task { @MainActor in
-          self?.appendDelta(assistantID: assistantID, delta: delta)
+      let reader = Task { @MainActor [weak self] in
+        for await event in listener.events {
+          guard let self, self.generation == token else { continue }
+          self.consume(event, assistantID: assistantID)
         }
       }
-      listener.onComplete = { [weak self] text in
-        Task { @MainActor in
-          self?.replaceAssistantText(assistantID: assistantID, text: text)
-        }
-      }
-      listener.onFailure = { [weak self] message in
-        Task { @MainActor in
-          self?.failStreaming(assistantID: assistantID, message: message)
-        }
-      }
-
       do {
-        var last = ""
-        for page in pages {
+        try Task.checkCancellation()
+        let final: String
+        if attachments.isEmpty {
+          final = try await agent.streamDocument(
+            text: prompt, threadId: threadID, document: host,
+            provider: configuration, listener: listener)
+        } else {
+          // Validation runs here, off the UI actor and before anything reaches
+          // the provider; the Rust side re-validates authoritatively.
+          let validationProbe = attachmentStore.validationProbe
+          try await Task.detached(priority: .userInitiated) {
+            if let validationProbe { try await validationProbe() }
+            try AskAttachmentStore.validateForSend(attachments)
+          }.value
+          // A Stop landing while validation was detached cancels before the
+          // Rust turn exists; without this re-check the finished validator
+          // would still start a provider request after Stop.
           try Task.checkCancellation()
-          last = try await agent.streamReply(
-            text: page, threadId: threadID, listener: listener)
+          guard let self, self.generation == token else { throw CancellationError() }
+          guard let streaming = agent as? any CodescribeAgentAttachmentStreaming else {
+            throw CsError.Agent(
+              msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+          }
+          final = try await streaming.streamDocumentWithAttachments(
+            text: prompt, threadId: threadID,
+            attachments: attachments.map { CsAttachment(path: $0.url.path) }, document: host,
+            provider: configuration, listener: listener)
         }
-        await MainActor.run { [weak self] in
-          self?.finishAssistant(assistantID: assistantID, text: last)
-        }
-      } catch is CancellationError {
-        await MainActor.run { [weak self] in
-          self?.failStreaming(assistantID: assistantID, message: "Ask was cancelled.")
+        listener.finish()
+        await reader.value
+        guard let self, self.generation == token else { return }
+        self.inFlightPrompt = nil
+        if let eventError = self.lastError {
+          // A failure reported through listener events is a failed send even
+          // when the call returned: keep the draft and every attachment.
+          if self.draft.isEmpty { self.draft = prompt }
+          self.complete(assistantID: assistantID, text: final, error: eventError)
+        } else {
+          // A completed send consumes its attachments: staged copies are
+          // released and the same images cannot be submitted twice.
+          attachmentStore.releaseSent(ids: attachments.map(\.id))
+          self.complete(assistantID: assistantID, text: final, error: nil)
         }
       } catch {
-        await MainActor.run { [weak self] in
-          self?.failStreaming(
-            assistantID: assistantID, message: error.localizedDescription)
-        }
+        listener.finish()
+        await reader.value
+        guard let self, self.generation == token else { return }
+        // A failed send keeps the draft (unless a newer one exists) and keeps
+        // every attachment pending.
+        if self.draft.isEmpty { self.draft = prompt }
+        self.inFlightPrompt = nil
+        self.complete(assistantID: assistantID, text: "", error: error.localizedDescription)
       }
     }
+    inFlightTask = sendTask
+    lastSendTask = sendTask
   }
 
-  private func appendDelta(assistantID: UUID, delta: String) {
+  private func consume(_ event: AskStreamListener.Event, assistantID: UUID) {
     guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    turns[index].text += delta
-    turns[index].isStreaming = true
-    phase = .streaming
-  }
-
-  private func replaceAssistantText(assistantID: UUID, text: String) {
-    guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    if !text.isEmpty {
-      turns[index].text = text
+    switch event {
+    case .delta(let text): turns[index].text += text
+    case .text(let text):
+      if !text.isEmpty { turns[index].text = text }
+    case .activity(let text): activity = text
+    case .failure(let message): lastError = message
+    case .approval(let request):
+      // The document registry grants only this buffer's reversible actions.
+      // Unexpected permissions are refused explicitly, never left waiting.
+      _ = agent.resolveToolApproval(
+        sessionId: request.sessionId, threadId: request.threadId, callId: request.callId,
+        approved: false, remember: false)
+      lastError = "The agent requested an action outside this document. It was refused."
     }
-    turns[index].isStreaming = true
-    phase = .streaming
   }
 
-  private func finishAssistant(assistantID: UUID, text: String) {
+  private func complete(assistantID: UUID, text: String, error: String?) {
     guard let index = turns.firstIndex(where: { $0.id == assistantID }) else { return }
-    if !text.isEmpty {
-      turns[index].text = text
-    }
+    if !text.isEmpty { turns[index].text = text }
     turns[index].isStreaming = false
-    phase = .completed
-    preflight = nil
+    activeHost?.invalidate()
+    activeHost = nil
+    generation = nil
+    lastError = error
+    phase = error.map(AskThreadPhase.failed) ?? .completed
+    activity = error == nil ? nil : "Failed"
+    inFlightTask = nil
   }
 
-  private func failStreaming(assistantID: UUID, message: String) {
-    if let index = turns.firstIndex(where: { $0.id == assistantID }) {
-      turns[index].isStreaming = false
-      if turns[index].text.isEmpty {
-        turns[index].text = message
-      }
-    }
-    lastError = message
-    phase = .failed(message)
-  }
 }
 
 enum AskThreadPhase: Equatable, Sendable {
   case idle
-  case awaitingConfirmation
   case streaming
   case completed
   case failed(String)
@@ -204,17 +231,23 @@ struct AskTurn: Equatable, Identifiable, Sendable {
   var role: Role
   var text: String
   var isStreaming: Bool
+  /// Exact pending-attachment IDs joined to this user turn at send time.
+  var attachmentIDs: [UUID]
 
-  init(id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false) {
+  init(
+    id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false,
+    attachmentIDs: [UUID] = []
+  ) {
     self.id = id
     self.role = role
     self.text = text
     self.isStreaming = isStreaming
+    self.attachmentIDs = attachmentIDs
   }
 }
 
 /// The credential Ask is gated on. Which case applies is read from the lane Ask
-/// actually streams through — codescribe's assistive lane (see
+/// actually streams through — Pensieve's embedded assistive lane (see
 /// `GrokAccountSnapshot.askProvider(apiKey:)`) — so Pensieve keeps no provider
 /// choice of its own that could disagree with where a question is sent.
 enum AskProvider: Equatable, Sendable {
@@ -227,21 +260,57 @@ enum AskProvider: Equatable, Sendable {
   case codex(accountAuthorized: Bool)
 }
 
-/// API-key providers are ready when the key is non-empty. Grok and Codex are
-/// ready only when the codescribe FFI reports that account authorized.
+/// The endpoint and model an API-key send is actually configured with. Ask
+/// readiness reads this so a genuinely loopback Responses endpoint can run
+/// without a credential while remote providers keep the API-key rule.
+struct AskEndpointContext: Equatable, Sendable {
+  var endpoint: String
+  var model: String
+
+  init(endpoint: String, model: String) {
+    self.endpoint = endpoint
+    self.model = model
+  }
+
+  init?(configuration: CsDocumentProvider?) {
+    guard let configuration else { return nil }
+    self.init(endpoint: configuration.endpoint, model: configuration.model)
+  }
+}
+
+/// API-key providers are ready when the key is non-empty, or when the
+/// configured endpoint is a genuinely loopback HTTP(S) Responses endpoint
+/// with a non-empty model (the donor's key-optional local lane). Grok and
+/// Codex are ready only when the embedded engine reports that Pensieve
+/// account authorized.
 enum AskReadiness {
   static let apiKeyNotReadyMessage = "Add a provider API key in Settings before asking."
   static let grokNotReadyMessage = "Sign in to Grok in Settings ▸ AI before asking."
   static let codexNotReadyMessage = "Sign in to Codex in Settings ▸ AI before asking."
 
-  static func isReady(_ provider: AskProvider) -> Bool {
+  static func isReady(_ provider: AskProvider, context: AskEndpointContext? = nil) -> Bool {
     switch provider {
     case .apiKey(let apiKey):
       let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      return !key.isEmpty
+      if !key.isEmpty { return true }
+      return context.map { isKeylessLoopback(endpoint: $0.endpoint, model: $0.model) } ?? false
     case .grok(let accountAuthorized), .codex(let accountAuthorized):
       return accountAuthorized
     }
+  }
+
+  /// Keyless Ask is lawful only against a real loopback server: a valid
+  /// http(s) URL whose host is exactly localhost / 127.0.0.1 / ::1 (the
+  /// shared `ProviderSettings` set — no parallel parser), with a model to
+  /// send. Lookalike hosts and non-HTTP schemes stay on the API-key rule.
+  static func isKeylessLoopback(endpoint: String, model: String) -> Bool {
+    guard let url = URL(string: endpoint),
+      let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https",
+      url.host != nil
+    else { return false }
+    guard ProviderSettings.isLocalProviderEndpoint(endpoint) else { return false }
+    return !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   static func notReadyMessage(for provider: AskProvider) -> String {
@@ -253,79 +322,21 @@ enum AskReadiness {
   }
 
   /// The composer's chip names the credential that will actually be used.
-  static func chipLabel(for provider: AskProvider) -> String {
+  static func chipLabel(for provider: AskProvider, context: AskEndpointContext? = nil) -> String {
     switch provider {
-    case .apiKey: return isReady(provider) ? "Ready" : "Needs API key"
+    case .apiKey:
+      guard isReady(provider, context: context) else { return "Needs API key" }
+      return provider.apiKeyPresent ? "Ready" : "Local endpoint ready"
     case .grok: return isReady(provider) ? "Grok ready" : "Grok: sign in"
     case .codex: return isReady(provider) ? "Codex ready" : "Codex: sign in"
     }
   }
 }
 
-struct AskPreflight: Equatable, Sendable {
-  /// Pagination protects the app: oversized context is split, never refused.
-  static let pageCharacterLimit = 8_000
-
-  var promptCharacters: Int
-  var documentCharacters: Int
-  var pageCount: Int
-  var totalCharacters: Int
-  var pages: [String]
-  var summary: String
-
-  static func make(prompt: String, document: String) -> AskPreflight {
-    let pages = paginate(prompt: prompt, document: document)
-    let total = pages.reduce(0) { $0 + $1.count }
-    return AskPreflight(
-      promptCharacters: prompt.count,
-      documentCharacters: document.count,
-      pageCount: pages.count,
-      totalCharacters: total,
-      pages: pages,
-      summary: summary(
-        promptCharacters: prompt.count,
-        documentCharacters: document.count,
-        pageCount: pages.count,
-        totalCharacters: total))
-  }
-
-  static func paginate(prompt: String, document: String) -> [String] {
-    let header = "Prompt:\n\(prompt)\n\nDocument:\n"
-    let combined = header + document
-    if combined.isEmpty { return [""] }
-    if combined.count <= pageCharacterLimit { return [combined] }
-
-    var pages: [String] = []
-    var remainder = combined
-    var index = 1
-    while !remainder.isEmpty {
-      let limit =
-        index == 1
-        ? pageCharacterLimit
-        : max(pageCharacterLimit - 32, 1)
-      let prefix = String(remainder.prefix(limit))
-      remainder = String(remainder.dropFirst(prefix.count))
-      if index == 1 {
-        pages.append(prefix)
-      } else {
-        pages.append("[continued \(index)]\n" + prefix)
-      }
-      index += 1
-    }
-    return pages
-  }
-
-  static func summary(
-    promptCharacters: Int,
-    documentCharacters: Int,
-    pageCount: Int,
-    totalCharacters: Int
-  ) -> String {
-    let pageWord = pageCount == 1 ? "page" : "pages"
-    return
-      "Prompt \(promptCharacters) characters. Document \(documentCharacters) characters. "
-      + "\(totalCharacters) characters will be processed across \(pageCount) \(pageWord). "
-      + "A long reply may take up to 20 minutes."
+extension AskProvider {
+  fileprivate var apiKeyPresent: Bool {
+    guard case .apiKey(let key) = self else { return false }
+    return !(key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
   }
 }
 
@@ -347,6 +358,8 @@ final class DocumentAskThreadStore: ObservableObject {
     return created
   }
 
+  func cancelAll() { for thread in threads.values { thread.cancel() } }
+
   /// Non-minting lookup for chrome that only OBSERVES a thread (the status
   /// bar's Ask chip). Minting on read would birth an empty thread for every
   /// document the window merely displays.
@@ -366,11 +379,40 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
     self.factory = factory
   }
 
-  func streamReply(text: String, threadId: String, listener: CsAgentListener) async throws
-    -> String
-  {
-    let agent = resolved()
-    return try await agent.streamReply(text: text, threadId: threadId, listener: listener)
+  func streamDocument(
+    text: String, threadId: String, document: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    try await resolved().streamDocument(
+      text: text, threadId: threadId, document: document, provider: provider, listener: listener)
+  }
+
+  func streamDocumentWithAttachments(
+    text: String, threadId: String, attachments: [CsAttachment], document: CsDocumentToolHost,
+    provider: CsDocumentProvider?, listener: CsAgentListener
+  ) async throws -> String {
+    guard let streaming = resolved() as? any CodescribeAgentAttachmentStreaming else {
+      throw CsError.Agent(
+        msg: "This Ask engine cannot send attachments. Remove them or update the app.")
+    }
+    return try await streaming.streamDocumentWithAttachments(
+      text: text, threadId: threadId, attachments: attachments, document: document,
+      provider: provider, listener: listener)
+  }
+
+  func cancelTurn(threadId: String) -> Bool {
+    lock.lock()
+    let agent = boxed
+    lock.unlock()
+    return agent?.cancelTurn(threadId: threadId) ?? false
+  }
+
+  func resolveToolApproval(
+    sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
+  ) -> Bool {
+    resolved().resolveToolApproval(
+      sessionId: sessionId, threadId: threadId, callId: callId, approved: approved,
+      remember: remember)
   }
 
   private func resolved() -> any CodescribeAgentStreaming {
@@ -383,17 +425,48 @@ final class DeferredCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendab
   }
 }
 
-final class AskStreamListener: CsAgentListener, @unchecked Sendable {
-  var onDelta: @Sendable (String) -> Void = { _ in }
-  var onComplete: @Sendable (String) -> Void = { _ in }
-  var onFailure: @Sendable (String) -> Void = { _ in }
+extension DeferredCodescribeAgent: CodescribeAgentAttachmentStreaming {}
 
-  func onTextDelta(delta: String) { onDelta(delta) }
-  func onTextDone(text: String) { onComplete(text) }
+final class AskStreamListener: CsAgentListener, Sendable {
+  enum Event: Sendable {
+    case delta(String)
+    case text(String)
+    case activity(String)
+    case failure(String)
+    case approval(CsToolApprovalRequest)
+  }
+  let events: AsyncStream<Event>
+  private let continuation: AsyncStream<Event>.Continuation
+
+  init() {
+    let stream = AsyncStream<Event>.makeStream()
+    events = stream.stream
+    continuation = stream.continuation
+  }
+
+  func finish() { continuation.finish() }
+  func onTextDelta(delta: String) { continuation.yield(.delta(delta)) }
+  func onTextDone(text: String) { continuation.yield(.text(text)) }
   func onReasoningDelta(delta: String) {}
-  func onToolExecuting(name: String, id: String) {}
-  func onToolApprovalRequested(request: CsToolApprovalRequest) {}
-  func onToolResult(name: String, id: String, summary: String, isError: Bool) {}
+  func onToolExecuting(name: String, id: String) {
+    let label: String
+    switch name {
+    case "document_read": label = "Reading document…"
+    case "document_search": label = "Searching document…"
+    case "document_replace": label = "Editing document…"
+    case "document_open": label = "Opening document…"
+    case "workspace_search": label = "Searching workspace…"
+    case "workspace_read": label = "Reading workspace file…"
+    default: label = "Working…"
+    }
+    continuation.yield(.activity(label))
+  }
+  func onToolApprovalRequested(request: CsToolApprovalRequest) {
+    continuation.yield(.approval(request))
+  }
+  func onToolResult(name: String, id: String, summary: String, isError: Bool) {
+    continuation.yield(.activity(isError ? "Action failed: \(summary)" : "Action completed"))
+  }
   func onDone() {}
-  func onError(message: String) { onFailure(message) }
+  func onError(message: String) { continuation.yield(.failure(message)) }
 }

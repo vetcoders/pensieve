@@ -158,6 +158,45 @@ GOOD_PAGE="$(make_page good "$VERSION_A" "$URL_A" "$PLACEHOLDER")"
 assert_status "a placeholder page for this version is stampable" 0 "" \
     landing_page_assert_publishable "$GOOD_PAGE" "$VERSION_A" "$URL_A"
 
+# HTML formatters may split the term, value and their text across lines.
+# Keep association strict: only the immediately following dd belongs to Version.
+FORMATTED_PAGE="$FIXTURE_ROOT/formatted-version.html"
+{
+    printf '<dl><div><dt>\n Version\n</dt>\n <dd>\n %s\n </dd></div></dl>\n' "$VERSION_A"
+    print_download_targets "$URL_A" "$URL_A" "$URL_A"
+    printf '<div class="sha"><b>SHA-256</b><br />%s</div>\n' "$PLACEHOLDER"
+} >"$FORMATTED_PAGE"
+assert_status "a formatted multiline version is stampable" 0 "" \
+    landing_page_assert_publishable "$FORMATTED_PAGE" "$VERSION_A" "$URL_A"
+assert_status "a formatted multiline version still rejects a mismatch" 1 "advertises version" \
+    landing_page_assert_publishable "$FORMATTED_PAGE" "$VERSION_B" "$URL_A"
+assert_status "a formatted page can be stamped" 0 "" \
+    landing_page_stamp_checksum "$FORMATTED_PAGE" "$SHA_A"
+assert_status "the final gate accepts the same formatted version" 0 "" \
+    landing_page_assert_published "$FORMATTED_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
+
+for version_case in duplicate empty preceding unrelated; do
+    VERSION_SHAPE_PAGE="$FIXTURE_ROOT/version-$version_case.html"
+    case "$version_case" in
+        duplicate) version_markup="<dt>Version</dt><dd>$VERSION_A</dd><dt>Version</dt><dd>$VERSION_A</dd>" ;;
+        empty) version_markup='<dt>Version</dt>
+<dd>
+</dd>' ;;
+        preceding) version_markup="<dd>$VERSION_A</dd><dt>Version</dt>" ;;
+        unrelated) version_markup="<dt>Version</dt>
+<dt>Platform</dt><dd>$VERSION_A</dd>" ;;
+    esac
+    {
+        printf '<dl>%s</dl>\n' "$version_markup"
+        print_download_targets "$URL_A" "$URL_A" "$URL_A"
+        printf '<div class="sha"><b>SHA-256</b><br />%s</div>\n' "$SHA_A"
+    } >"$VERSION_SHAPE_PAGE"
+    assert_status "version association rejects $version_case at preflight" 1 "" \
+        landing_page_assert_publishable "$VERSION_SHAPE_PAGE" "$VERSION_A" "$URL_A"
+    assert_status "version association rejects $version_case at the final gate" 1 "" \
+        landing_page_assert_published "$VERSION_SHAPE_PAGE" "$SHA_A" "$VERSION_A" "$URL_A"
+done
+
 assert_status "a missing page is a failure, not a silent pass" 1 "no landing page at" \
     landing_page_assert_publishable "$FIXTURE_ROOT/absent.html" "$VERSION_A" "$URL_A"
 

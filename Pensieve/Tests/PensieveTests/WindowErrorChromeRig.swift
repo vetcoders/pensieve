@@ -19,6 +19,7 @@ final class WindowErrorChromeRig {
   let appState: AppState
   let controller: AppController
   let themeManager: ThemeManager
+  let askThreads = DocumentAskThreadStore()
   let window: NSWindow
   let hosting: NSHostingView<AnyView>
 
@@ -52,10 +53,12 @@ final class WindowErrorChromeRig {
           // Configured + autocomplete off, so the onboarding sheet this window
           // can present never becomes eligible and never covers the chrome.
           providerOnboardingCoordinator: ProviderOnboardingCoordinator(
-            autocompleteEnabled: false, providerConfigured: true)
+            autocompleteEnabled: false, providerConfigured: true),
+          askThreads: askThreads
         )
         // The same chrome contract every production window root carries.
         .pensieveSkinAppearance(themeManager)
+        .defaultAppStorage(defaults)
         .environment(appState)
         .environmentObject(controller)
         .environmentObject(controller.transcriptionService)

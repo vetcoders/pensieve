@@ -83,6 +83,12 @@ enum MarkdownFormatter {
     let contentRange: NSRange
   }
 
+  private enum ContinuationAction {
+    case next(String)
+    case endContainer
+    case unchanged
+  }
+
   private enum AutoconversionPatterns {
     /// `[~]` ("in progress") continues like the other two states — Return on a
     /// `- [~] …` line opens the next item as an empty `- [ ] `, not a bare dash.
@@ -185,8 +191,10 @@ enum MarkdownFormatter {
       in: line,
       caretRange: range,
       marker: { captures in
-        guard !captures[2].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        return "\(captures[0])\(captures[1]) [ ] "
+        guard !captures[2].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return .endContainer
+        }
+        return .next("\(captures[0])\(captures[1]) [ ] ")
       }
     ) {
       return conversion
@@ -197,9 +205,11 @@ enum MarkdownFormatter {
       in: line,
       caretRange: range,
       marker: { captures in
-        guard !captures[3].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        let nextNumber = (Int(captures[1]) ?? 0) + 1
-        return "\(captures[0])\(nextNumber)\(captures[2]) [ ] "
+        guard !captures[3].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return .endContainer
+        }
+        guard let number = Int(captures[1]), number < Int.max else { return .unchanged }
+        return .next("\(captures[0])\(number + 1)\(captures[2]) [ ] ")
       }
     ) {
       return conversion
@@ -210,8 +220,10 @@ enum MarkdownFormatter {
       in: line,
       caretRange: range,
       marker: { captures in
-        guard !captures[2].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        return "\(captures[0])\(captures[1]) "
+        guard !captures[2].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return .endContainer
+        }
+        return .next("\(captures[0])\(captures[1]) ")
       }
     ) {
       return conversion
@@ -222,9 +234,11 @@ enum MarkdownFormatter {
       in: line,
       caretRange: range,
       marker: { captures in
-        guard !captures[3].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        let nextNumber = (Int(captures[1]) ?? 0) + 1
-        return "\(captures[0])\(nextNumber)\(captures[2]) "
+        guard !captures[3].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return .endContainer
+        }
+        guard let number = Int(captures[1]), number < Int.max else { return .unchanged }
+        return .next("\(captures[0])\(number + 1)\(captures[2]) ")
       }
     ) {
       return conversion
@@ -235,8 +249,10 @@ enum MarkdownFormatter {
       in: line,
       caretRange: range,
       marker: { captures in
-        guard !captures[1].trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        return "\(captures[0])> "
+        guard !captures[1].trimmingCharacters(in: .whitespaces).isEmpty else {
+          return .endContainer
+        }
+        return .next("\(captures[0])> ")
       }
     )
   }
@@ -312,7 +328,7 @@ enum MarkdownFormatter {
     matching regex: NSRegularExpression,
     in line: CurrentLine,
     caretRange: NSRange,
-    marker: ([String]) -> String?
+    marker: ([String]) -> ContinuationAction
   ) -> MarkdownAutoconversion? {
     let nsLine = line.text as NSString
     let fullLine = NSRange(location: 0, length: nsLine.length)
@@ -325,7 +341,13 @@ enum MarkdownFormatter {
       return range.location == NSNotFound ? "" : nsLine.substring(with: range)
     }
 
-    guard let nextMarker = marker(captures) else {
+    let nextMarker: String
+    switch marker(captures) {
+    case .unchanged:
+      return nil
+    case .next(let value):
+      nextMarker = value
+    case .endContainer:
       return MarkdownAutoconversion(
         range: NSRange(location: line.start, length: caretRange.location - line.start),
         replacement: "",

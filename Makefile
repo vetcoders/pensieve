@@ -57,10 +57,9 @@ run-release: release-local  ## Launch signed .app with the production Pensieve p
 	@open "$(APP_BUNDLE)"
 
 .PHONY: install-app
-install-app: init-hooks  ## Build signed .app, then install only when Pensieve is idle
-	@$(SCRIPTS)/install-built-app.sh --check-idle
+install-app: init-hooks  ## Build signed .app, gracefully quit Pensieve, install and reopen
 	@$(MAKE) release-local
-	@$(SCRIPTS)/install-built-app.sh "$(APP_BUNDLE)"
+	@$(SCRIPTS)/install-built-app.sh --restart "$(APP_BUNDLE)"
 
 .PHONY: install-built-app
 install-built-app:  ## Verify + install the existing signed/notarized .app without rebuilding or quitting

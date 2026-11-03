@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 
@@ -6,6 +7,49 @@ import XCTest
 
 @MainActor
 final class PensieveSettingsWindowControllerTests: XCTestCase {
+  func testDocumentFocusDoesNotRepublishInactiveSettingsOwnership() {
+    let center = NotificationCenter()
+    let settings = makeWindow()
+    let document = makeWindow()
+    let controller = PensieveSettingsWindowController(
+      window: settings, selection: PensieveSettingsSelection(), notificationCenter: center)
+    defer {
+      close(document)
+      close(settings)
+    }
+    var publications: [Bool] = []
+    let subscription = controller.$ownsCommandSurface.dropFirst().sink { publications.append($0) }
+    defer { subscription.cancel() }
+
+    // AppKit can emit this synchronously inside SwiftUI's first window layout.
+    // Settings is already inactive: emitting objectWillChange here is invalid
+    // render-time mutation even though the assigned Boolean does not change.
+    center.post(name: NSWindow.didBecomeKeyNotification, object: document)
+    center.post(name: NSWindow.didBecomeKeyNotification, object: document)
+
+    XCTAssertFalse(controller.ownsCommandSurface)
+    XCTAssertTrue(publications.isEmpty, "unrelated document focus must not invalidate Settings")
+  }
+
+  func testSettingsOwnershipPublishesOnlyRealFocusTransitions() {
+    let center = NotificationCenter()
+    let window = makeWindow()
+    let controller = PensieveSettingsWindowController(
+      window: window, selection: PensieveSettingsSelection(), notificationCenter: center)
+    defer { close(window) }
+    var publications: [Bool] = []
+    let subscription = controller.$ownsCommandSurface.dropFirst().sink { publications.append($0) }
+    defer { subscription.cancel() }
+
+    center.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    center.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    center.post(name: NSWindow.didResignKeyNotification, object: window)
+    center.post(name: NSWindow.willCloseNotification, object: window)
+
+    XCTAssertEqual(publications, [true, false])
+    XCTAssertFalse(controller.ownsCommandSurface)
+  }
+
   func testControllerSealsTheSettingsWindowFromTabbingAndRestoration() {
     let window = makeWindow()
     window.title = "General"

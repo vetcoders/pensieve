@@ -15,15 +15,17 @@ struct ProviderSettingsView: View {
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 20) {
-      VStack(alignment: .leading, spacing: 6) {
-        Text("AI Autocomplete")
-          .font(.title2.weight(.semibold))
-        Text("Connect the provider that powers inline suggestions as you type.")
-          .foregroundStyle(.secondary)
-      }
+    Form {
+      Section {
+        VStack(alignment: .leading, spacing: 6) {
+          Text("AI")
+            .font(.title2.weight(.semibold))
+          Text("Configure autocomplete and choose the account used by Ask.")
+            .foregroundStyle(.secondary)
+        }
 
-      Form {
+      }
+      Section("Autocomplete / API key") {
         Picker("Provider API", selection: $settings.providerShape) {
           ForEach(CompletionProviderShape.allCases) { shape in
             Text(shape.displayName).tag(shape)
@@ -77,59 +79,60 @@ struct ProviderSettingsView: View {
         }
         .accessibilityIdentifier("pensieve.provider.forgetAPIKey")
 
-        GrokAccountSection(account: grokAccount, apiKeyProvider: settings.providerShape)
-        CodexAccountSection(account: codexAccount, apiKeyProvider: settings.providerShape)
       }
-      .formStyle(.grouped)
-      .task {
-        await grokAccount.refresh()
-        await codexAccount.refresh()
-        await grokAccount.adoptGrokForAskIfSignedIn()
-        await codexAccount.adoptCodexForAskIfSignedIn()
-      }
+      GrokAccountSection(account: grokAccount, apiKeyProvider: settings.providerShape)
+      CodexAccountSection(account: codexAccount, apiKeyProvider: settings.providerShape)
+      Section {
 
-      VStack(alignment: .leading, spacing: 5) {
-        Label("Your API key is stored only in the macOS Keychain.", systemImage: "key.fill")
-        Text("Changes take effect immediately — no restart needed.")
-      }
-      .font(.caption)
-      .foregroundStyle(.secondary)
-
-      if let discoveryStatus = settings.modelDiscoveryStatus {
-        Label(discoveryStatus, systemImage: "network")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
-          .accessibilityIdentifier("pensieve.provider.discoveryStatus")
-      }
-
-      if let error = settings.lastError {
-        Label(error, systemImage: "exclamationmark.triangle.fill")
-          .font(.caption)
-          .foregroundStyle(.red)
-          .accessibilityIdentifier("pensieve.provider.error")
-      } else if let status = settings.saveStatus {
-        Label(status, systemImage: "checkmark.circle.fill")
-          .font(.caption)
-          .foregroundStyle(.green)
-          .accessibilityIdentifier("pensieve.provider.saved")
-      } else if settings.usesInheritedEnvironmentAtLaunch {
-        Label("A provider is already set up by your environment.", systemImage: "terminal")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-      }
-
-      HStack {
-        Spacer()
-        Button("Save") {
-          try? settings.save()
+        VStack(alignment: .leading, spacing: 5) {
+          Label("Your API key is stored only in the macOS Keychain.", systemImage: "key.fill")
+          Text("Changes take effect immediately — no restart needed.")
         }
-        .keyboardShortcut(.defaultAction)
-        .disabled(!settings.isDraftValid)
-        .accessibilityIdentifier("pensieve.provider.save")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+        if let discoveryStatus = settings.modelDiscoveryStatus {
+          Label(discoveryStatus, systemImage: "network")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityIdentifier("pensieve.provider.discoveryStatus")
+        }
+
+        if let error = settings.lastError {
+          Label(error, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.red)
+            .accessibilityIdentifier("pensieve.provider.error")
+        } else if let status = settings.saveStatus {
+          Label(status, systemImage: "checkmark.circle.fill")
+            .font(.caption)
+            .foregroundStyle(.green)
+            .accessibilityIdentifier("pensieve.provider.saved")
+        } else if settings.usesInheritedEnvironmentAtLaunch {
+          Label("A provider is already set up by your environment.", systemImage: "terminal")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+
+        HStack {
+          Spacer()
+          Button("Save API Settings") {
+            try? settings.save()
+          }
+          .keyboardShortcut(.defaultAction)
+          .disabled(!settings.isDraftValid)
+          .accessibilityIdentifier("pensieve.provider.save")
+        }
       }
     }
-    .padding(24)
+    .formStyle(.grouped)
+    .task {
+      await grokAccount.refresh()
+      await codexAccount.refresh()
+      await grokAccount.adoptGrokForAskIfSignedIn()
+      await codexAccount.adoptCodexForAskIfSignedIn()
+    }
     .frame(width: 560, height: 540, alignment: .topLeading)
     .accessibilityIdentifier("pensieve.provider.settings")
   }

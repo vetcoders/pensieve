@@ -58,6 +58,7 @@ final class AutocompleteController: ObservableObject {
   private var requestID: UInt64 = 0
   private var completionTask: Task<Void, Never>?
   private var rewriteTask: Task<Void, Never>?
+  private var rewriteRequestID: UInt64 = 0
   private var providerSettingsCancellable: AnyCancellable?
   private var documentSession = DocumentAISession(documentID: "unbound")
   private var documentRevision: UInt64 = 0
@@ -280,10 +281,8 @@ final class AutocompleteController: ObservableObject {
   }
 
   func requestRewrite(context: RewriteContext, intent: RewriteIntent) {
-    rewriteTask?.cancel()
-    rewriteTask = nil
-    rewriteCandidate = nil
-    rewritePreview = nil
+    cancelRewrite()
+    let currentRequestID = rewriteRequestID
     lastError = nil
     guard hasEngineSource else {
       lastError = Self.engineUnavailableMessage
@@ -299,7 +298,7 @@ final class AutocompleteController: ObservableObject {
           context: context, intent: intent, session: session)
         try Task.checkCancellation()
         await MainActor.run { [weak self] in
-          guard let self else { return }
+          guard let self, self.rewriteRequestID == currentRequestID else { return }
           self.rewriteTask = nil
           self.rewriteCandidate = produced
           self.rewritePreview = AIRewritePreview(
@@ -314,8 +313,9 @@ final class AutocompleteController: ObservableObject {
         return
       } catch {
         await MainActor.run { [weak self] in
-          self?.rewriteTask = nil
-          self?.lastError = Self.displayMessage(for: error)
+          guard let self, self.rewriteRequestID == currentRequestID else { return }
+          self.rewriteTask = nil
+          self.lastError = Self.displayMessage(for: error)
         }
       }
     }
@@ -338,6 +338,9 @@ final class AutocompleteController: ObservableObject {
   }
 
   func cancelRewrite() {
+    // Providers may report a transport error after cancellation. That result
+    // must not clear a newer task's handle or publish into another document.
+    rewriteRequestID &+= 1
     rewriteTask?.cancel()
     rewriteTask = nil
     rewriteCandidate = nil

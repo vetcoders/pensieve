@@ -12,6 +12,48 @@ import XCTest
 ///      `applyRefresh` without ever owning the activity display.
 @MainActor
 final class WorkspaceOpenActivityTests: XCTestCase {
+  func testOversizedPresentationCacheIsNotDecodedOnTheOpeningThread() throws {
+    let folder = try makeTemporaryFolder()
+    let support = try makeTemporaryFolder(prefix: "PensieveOversizedCacheTests")
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+      try? FileManager.default.removeItem(at: support)
+    }
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+    let store = WorkspaceCacheStore(baseDirectory: support)
+    let cacheURL = store.workspaceScansURL(for: identity)
+    try FileManager.default.createDirectory(
+      at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(repeating: 0, count: 65_537).write(to: cacheURL)
+
+    XCTAssertNil(try store.readWorkspaceScans(for: identity))
+  }
+
+  func testOversizedWorkspaceTreeDoesNotCreateAnUnreadablePresentationCache() throws {
+    let folder = try makeTemporaryFolder()
+    let support = try makeTemporaryFolder(prefix: "PensieveOversizedCacheWriteTests")
+    defer {
+      try? FileManager.default.removeItem(at: folder)
+      try? FileManager.default.removeItem(at: support)
+    }
+    let identity = WorkspaceIdentity.make(rootURL: folder, bookmarkData: nil)
+    let store = WorkspaceCacheStore(baseDirectory: support)
+    let children = (0..<1_000).map { index in
+      WorkspaceNode(
+        id: "\(folder.path)/very-long-document-name-\(index)-for-presentation-cache.md",
+        name: "very-long-document-name-\(index)-for-presentation-cache.md",
+        kind: .foreignFile,
+        url: nil,
+        children: nil)
+    }
+    let root = WorkspaceNode(
+      id: folder.path, name: "root", kind: .folder, url: folder, children: children)
+    try store.writeWorkspaceScans([WorkspaceScan(documents: [], rootNode: root)], for: identity)
+
+    XCTAssertFalse(
+      FileManager.default.fileExists(atPath: store.workspaceScansURL(for: identity).path))
+  }
+
   func testColdStartPublishesCachedWorkspaceBeforeValidationWalkFinishes() async throws {
     let folder = try makeTemporaryFolder()
     let support = try makeTemporaryFolder(prefix: "PensieveCachedWorkspaceSupportTests")

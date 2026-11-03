@@ -117,6 +117,7 @@ struct GrokAccountSnapshot: Equatable, Sendable {
   /// The assistive lane — the one `CodescribeAgent.streamReply` sends Ask
   /// through — resolves to xAI.
   var askUsesGrok = false
+  var askUsesCodex = false
   /// Provider id currently on the assistive lane, so Settings can name Codex
   /// when Ask is not on Grok and not on an API key.
   var assistiveProviderID = ""
@@ -294,7 +295,7 @@ final class GrokAccount: ObservableObject {
   /// outlasts a short timeout. Five minutes matches the Codescribe app.
   nonisolated static let loginTimeoutSeconds: UInt64 = 300
 
-  static let shared = GrokAccount(laneChoiceDefaults: .standard)
+  static let shared = GrokAccount(laneChoiceDefaults: .standard, accountState: .shared)
 
   @Published private(set) var snapshot: GrokAccountSnapshot = .unknown
   @Published private(set) var phase: GrokLoginPhase = .idle
@@ -305,6 +306,8 @@ final class GrokAccount: ObservableObject {
 
   private let bridge: any CodescribeAccountBridging
   private let laneChoiceDefaults: UserDefaults?
+  private let accountState: AskAccountState
+  private var stateSubscription: AnyCancellable?
   private let staleAfter: TimeInterval
   private let now: () -> Date
   private var lastRefresh: Date?
@@ -320,28 +323,26 @@ final class GrokAccount: ObservableObject {
     signInAllowed: Bool = SandboxCapabilities.allowsAccountSignIn(),
     laneChoiceDefaults: UserDefaults? = nil,
     staleAfter: TimeInterval = 30,
-    now: @escaping () -> Date = Date.init
+    now: @escaping () -> Date = Date.init,
+    accountState: AskAccountState? = nil
   ) {
-    self.bridge = bridge ?? Self.defaultBridge()
+    let state = accountState ?? AskAccountState(bridge: bridge, defaults: laneChoiceDefaults)
+    self.accountState = state
+    self.bridge = state.bridge
     self.signInAllowed = signInAllowed
     self.laneChoiceDefaults = laneChoiceDefaults
     self.staleAfter = staleAfter
     self.now = now
-  }
-
-  nonisolated private static func defaultBridge() -> any CodescribeAccountBridging {
-    if AppSupportLocation.isRunningTests() { return InertCodescribeAccountBridge() }
-    return LiveCodescribeAccountBridge()
-  }
-
-  /// Re-read the account row and the assistive lane from the FFI.
-  func refresh() async {
-    let bridge = self.bridge
-    if let read = try? await Self.offMain({
-      (providers: bridge.availableProviders(), lane: bridge.assistiveLane())
-    }) {
-      snapshot = GrokAccountSnapshot(providers: read.providers, assistiveLane: read.lane)
+    stateSubscription = state.$snapshot.sink { [weak self] snapshot in
+      guard let self, let snapshot else { return }
+      self.snapshot = snapshot.grok
+      self.hasLoaded = true
+      self.lastRefresh = self.now()
     }
+  }
+
+  func refresh() async {
+    await accountState.refresh()
     hasLoaded = true
     lastRefresh = now()
   }
@@ -414,8 +415,7 @@ final class GrokAccount: ObservableObject {
         // Signing in is the choice to ask with Grok. The assistive lane stays
         // on the API-key provider until something writes it, and that left the
         // chip on "Needs API key" after a successful xAI login.
-        Self.pinAccount(Self.providerID, defaults: laneChoiceDefaults)
-        await routeAsk(to: providerID)
+        await routeAsk(to: providerID, choice: .account)
       } else {
         phase = .failed(.other("xAI reported success, but no Grok account was stored."))
       }
@@ -454,18 +454,14 @@ final class GrokAccount: ObservableObject {
     await refresh()
   }
 
-  /// Routes Ask to Grok by pointing codescribe's assistive lane at xAI. A
-  /// persisted lane provider outranks the `LLM_ASSISTIVE_PROVIDER` that
-  /// ProviderSettings exports (codescribe docs/lane-truth.md), so the very
-  /// next `streamReply` goes to Grok.
+  /// Routes Ask through the shared selection owner, which updates both the
+  /// process override and persisted lane before publishing the new snapshot.
   func useGrokForAsk() async {
     guard snapshot.isSignedIn else {
       lastError = AskReadiness.grokNotReadyMessage
       return
     }
-    Self.pinAccount(Self.providerID, defaults: laneChoiceDefaults)
-    guard !snapshot.askUsesGrok else { return }
-    await routeAsk(to: Self.providerID)
+    await routeAsk(to: Self.providerID, choice: .account)
   }
 
   /// A signed-in Grok account drives Ask unless the user pinned the API-key
@@ -484,13 +480,10 @@ final class GrokAccount: ObservableObject {
   /// Hands Ask back to the API-key provider. codescribe refuses an empty lane
   /// provider — every value is resolved against its catalog — so the Grok
   /// routing cannot be cleared, only replaced: by the API-key provider's own
-  /// id, which `CompletionProviderShape` shares with codescribe. Off Grok this
-  /// writes nothing: codescribe's settings.json is shared with the Codescribe
-  /// app, and Pensieve only owns the move into and out of Grok.
+  /// id, which `CompletionProviderShape` shares with codescribe. Explicit
+  /// selection reaches the engine even when this account is not active.
   func useAPIKeyProviderForAsk(_ shape: CompletionProviderShape) async {
-    guard snapshot.askUsesGrok else { return }
-    Self.pinAPIKey(laneChoiceDefaults)
-    await routeAsk(to: shape.rawValue)
+    await routeAsk(to: shape.rawValue, choice: .apiKey)
   }
 
   static func apiKeyLaneIsPinned(_ defaults: UserDefaults?) -> Bool {
@@ -512,22 +505,17 @@ final class GrokAccount: ObservableObject {
     defaults?.removeObject(forKey: accountLanePinnedKey)
   }
 
-  private func routeAsk(to providerID: String) async {
-    let bridge = self.bridge
+  private func routeAsk(
+    to providerID: String, choice: AskAccountState.Choice = .automatic
+  ) async {
     do {
-      try await Self.offMain {
-        try bridge.setLaneProvider(lane: .assistive, providerId: providerID)
-      }
+      try await accountState.select(providerID, choice: choice)
       lastError = nil
     } catch {
       lastError = "Could not switch the Ask provider: \(GrokLoginFailure.detail(of: error))"
     }
-    await refresh()
   }
 
-  /// Runs one blocking codescribe call on a GCD worker. `start` performs a
-  /// network request and `await` parks for up to five minutes; neither may
-  /// hold the main actor or a cooperative-pool thread.
   nonisolated private static func offMain<T: Sendable>(
     _ work: @escaping @Sendable () throws -> T
   ) async throws -> T {

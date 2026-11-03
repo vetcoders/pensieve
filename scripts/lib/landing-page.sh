@@ -223,13 +223,22 @@ landing_page_declared_version() {
 
     landing_page_readable "$page" || return $?
     /usr/bin/awk '
-        /<dt>Version<\/dt>/ {
-            if (match($0, /<dd>[^<]*<\/dd>/)) {
-                value = substr($0, RSTART + 4, RLENGTH - 9)
-                gsub(/^[ \t\r]+|[ \t\r]+$/, "", value)
-                print (value == "" ? "!empty" : value)
-            } else {
-                print "!unparsable"
+        { html = html $0 "\n" }
+        END {
+            # Whitespace and line wrapping do not change the HTML association.
+            # Count every term, including multiple declarations on one line;
+            # never borrow a value from before it or from another term.
+            while (match(html, /<dt>[ \t\r\n]*Version[ \t\r\n]*<\/dt>/)) {
+                html = substr(html, RSTART + RLENGTH)
+                if (match(html, /^[ \t\r\n]*<dd>[^<]*<\/dd>/)) {
+                    value = substr(html, RSTART, RLENGTH)
+                    sub(/^[ \t\r\n]*<dd>/, "", value)
+                    sub(/<\/dd>$/, "", value)
+                    gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", value)
+                    print (value == "" ? "!empty" : value)
+                } else {
+                    print "!unparsable"
+                }
             }
         }
     ' "$page" || {

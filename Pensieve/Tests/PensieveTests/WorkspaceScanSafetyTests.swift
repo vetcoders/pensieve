@@ -169,6 +169,10 @@ final class WorkspaceScanSafetyTests: XCTestCase {
     releaseScan.signal()
     await manager.waitForPendingWorkspaceBuild()
 
+    XCTAssertFalse(retainsValidationResult(manager), "completed scans must leave the task owner")
+    manager.closeWorkspace(into: appState)
+    XCTAssertFalse(retainsValidationResult(manager), "closed workspaces must release scan results")
+
     let observations = probe.snapshot()
     XCTAssertEqual(Set(observations.map(\.stage)), Set(WorkspaceValidationStage.allCases))
     XCTAssertTrue(
@@ -221,10 +225,12 @@ final class WorkspaceScanSafetyTests: XCTestCase {
     XCTAssertEqual(appState.workspaceActivity?.kind, .opening)
 
     manager.closeWorkspace(into: appState)
+    XCTAssertFalse(retainsValidationResult(manager), "close must release the cancelled scan handle")
     manager.openInBackground(url: secondRoot, into: appState)
     await fulfillment(of: [secondStarted], timeout: 1)
     XCTAssertEqual(appState.workspaceActivity?.kind, .opening)
 
+    XCTAssertTrue(retainsValidationResult(manager), "the newer scan must remain cancellable")
     releaseFirst.signal()
     try await Task.sleep(for: .milliseconds(50))
     XCTAssertEqual(
@@ -233,12 +239,22 @@ final class WorkspaceScanSafetyTests: XCTestCase {
       "the cancelled A flow must not clear B's activity"
     )
     XCTAssertFalse(appState.documents.contains { $0.url == firstNote.standardizedFileURL })
+    XCTAssertTrue(
+      retainsValidationResult(manager), "an older completion must not clear the newer handle")
 
     releaseSecond.signal()
     await manager.waitForPendingWorkspaceBuild()
     await manager.waitForPendingIndexUpdate()
     XCTAssertEqual(appState.documents.map(\.url), [secondNote.standardizedFileURL])
     XCTAssertNil(appState.workspaceActivity)
+  }
+
+  private func retainsValidationResult(_ manager: FolderManager) -> Bool {
+    // Inspect ownership without exposing a task returning a complete workspace
+    // tree as production API. A completed Task retains its success value.
+    let field = Mirror(reflecting: manager).children.first { $0.label == "workspaceValidationTask" }
+    XCTAssertNotNil(field)
+    return field.map { !Mirror(reflecting: $0.value).children.isEmpty } ?? false
   }
 
   private func makeTemporaryFolder(prefix: String) throws -> URL {

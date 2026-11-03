@@ -5,6 +5,63 @@ import XCTest
 @testable import Pensieve
 
 final class MarkdownFormatterTests: XCTestCase {
+  func testLargestIncrementableOrdinalStillContinuesListsAndTasks() {
+    for (suffix, nextSuffix) in [(". item", ". "), (") [x] done", ") [ ] ")] {
+      let original = "\(Int.max - 1)" + suffix
+      let conversion = MarkdownFormatter.autoconversion(
+        in: original, range: NSRange(location: original.utf16.count, length: 0), replacement: "\n")
+      XCTAssertEqual(conversion?.replacement, "\n\(Int.max)" + nextSuffix)
+    }
+  }
+
+  @MainActor
+  func testReturnOnUnrepresentableOrdinalPreservesTextWithoutAutoconversion() {
+    for number in [String(Int.max), String(repeating: "9", count: 80)] {
+      for suffix in [". item", ") [x] done"] {
+        let original = number + suffix
+        let surface = MarkdownEditorSurface(text: original, fontSize: 14)
+        let end = (original as NSString).length
+        surface.textView.setSelectedRange(NSRange(location: end, length: 0))
+
+        surface.textView.insertText("\n", replacementRange: NSRange(location: end, length: 0))
+
+        XCTAssertEqual(surface.textStorage.string, original + "\n")
+        surface.textView.undoManager?.undo()
+        XCTAssertEqual(surface.textStorage.string, original)
+      }
+    }
+  }
+
+  @MainActor
+  func testListReturnDoesNotForceWholeDocumentHighlighting() async throws {
+    let tail = String(repeating: "A paragraph in a large document.\n\n", count: 4_000)
+    let surface = MarkdownEditorSurface(text: "- alpha\n\n" + tail, fontSize: 14)
+    // Finish the initial load debounce before measuring the keystroke.
+    try await Task.sleep(for: .milliseconds(150))
+    let fullRefreshes = surface.textContentStorage.fullRefreshCount
+    surface.textView.setSelectedRange(NSRange(location: 7, length: 0))
+
+    surface.textView.insertText("\n", replacementRange: NSRange(location: 7, length: 0))
+
+    XCTAssertEqual(surface.textStorage.string, "- alpha\n- \n\n" + tail)
+    XCTAssertEqual(
+      surface.textContentStorage.fullRefreshCount, fullRefreshes,
+      "one Return in a list must not synchronously repaint the whole document")
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertEqual(surface.textContentStorage.fullRefreshCount, fullRefreshes)
+    XCTAssertLessThan(
+      surface.textContentStorage.longestSynchronousHighlightLength,
+      surface.textStorage.length)
+    let expected = NSTextStorage(string: surface.textStorage.string)
+    let range = NSRange(location: 0, length: expected.length)
+    surface.textContentStorage.highlighter.resetBaseAttributes(expected, range: range)
+    surface.textContentStorage.highlighter.highlight(expected, range: range)
+    XCTAssertTrue(
+      surface.textStorage.attributedSubstring(from: NSRange(location: 0, length: 10))
+        .isEqual(to: expected.attributedSubstring(from: NSRange(location: 0, length: 10))),
+      "the inserted list marker must still receive the correct highlighting")
+  }
+
   func testLegacyMarkdownFormatterOutputs() {
     XCTAssertEqual(MarkdownFormatter.format("text", as: .bold), "**text**")
     XCTAssertEqual(MarkdownFormatter.format("text", as: .italic), "*text*")

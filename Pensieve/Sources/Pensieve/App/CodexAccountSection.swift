@@ -33,7 +33,7 @@ struct CodexAccountSection: View {
     } footer: {
       Text(
         "Codex signs in with the OpenAI/Codex device code you approve. "
-          + "Changes apply at once — Save is only for the autocomplete provider."
+          + "Changes apply at once — Save API Settings applies only to the API configuration."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -103,7 +103,7 @@ struct CodexAccountSection: View {
     case .awaitingApproval(let code):
       CodexDeviceCodePanel(code: code)
     case .authorized:
-      Label("Signed in. Codex can answer Ask.", systemImage: "checkmark.circle.fill")
+      Label("Signed in.", systemImage: "checkmark.circle.fill")
         .font(.caption)
         .foregroundStyle(.green)
         .accessibilityIdentifier("pensieve.provider.codex.authorized")

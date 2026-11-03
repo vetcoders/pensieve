@@ -9,7 +9,7 @@ trap 'rm -f "$report"' EXIT
 
 cd "$repo_root"
 
-if git grep -n -E 'nosemgrep|nosem' -- Pensieve docs ':!Pensieve/Sources/Pensieve/Resources/*.min.js'; then
+if git grep -I -n -E 'nosemgrep|nosem' -- Pensieve docs ':!Pensieve/Sources/Pensieve/Resources/*.min.js'; then
   printf '[fail] Inline Semgrep suppressions are forbidden; record reviewed exceptions in %s.\n' "$policy" >&2
   exit 1
 fi

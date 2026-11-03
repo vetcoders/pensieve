@@ -35,6 +35,7 @@ enum WorkspaceValidationStage: String, CaseIterable, Hashable, Sendable {
 
 struct WorkspaceValidationResult: Sendable {
   var scans: [WorkspaceScan]
+  var presentationSignature: WorkspacePresentationSignature
   var fingerprint: TreeFingerprint?
   var verdict: WorkspaceCacheVerdict?
   /// The baseline to restore into `lastWorkspaceSignature`: the persisted signature when there is
@@ -97,6 +98,8 @@ final class WorkspaceSubstrate: Sendable {
       probe(.workspaceScan)
       let scans = workspaceBuilder(currentRoots, currentExclusions)
       try Task.checkCancellation()
+      let presentationSignature = WorkspacePresentationSignature(scans: scans)
+      try Task.checkCancellation()
       DebugTrace.log("workspace validation walk.count=1 roots=\(currentRoots.count)")
 
       probe(.treeFingerprint)
@@ -143,6 +146,7 @@ final class WorkspaceSubstrate: Sendable {
 
       return WorkspaceValidationResult(
         scans: scans,
+        presentationSignature: presentationSignature,
         fingerprint: fingerprint,
         verdict: verdict,
         searchSignature: searchSignature,

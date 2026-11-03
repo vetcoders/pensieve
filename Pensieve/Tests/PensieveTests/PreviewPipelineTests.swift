@@ -1,3 +1,4 @@
+import Synchronization
 import XCTest
 
 @testable import Pensieve
@@ -201,6 +202,96 @@ final class PreviewPipelineTests: XCTestCase {
     )
     XCTAssertFalse(document.html.contains("'</script>'"))
     XCTAssertTrue(document.html.contains("'<\\/script>'"))
+  }
+
+  @MainActor
+  func testDebouncedLargePreviewLeavesMainActorResponsive() async throws {
+    let sink = RecordingPreviewSink()
+    let pipeline = PreviewPipeline(
+      themeManager: ThemeManager(defaults: makeEphemeralDefaults(prefix: "PreviewResponsiveness")),
+      debounce: .milliseconds(1))
+    pipeline.attach(sink: sink)
+    defer { pipeline.detach() }
+    let request = PreviewRenderRequest(
+      markdown: String(
+        repeating: "## Heading\n\nSome **bold** text and a [link](https://example.org).\n\n",
+        count: 18_000),
+      fontSize: 14, theme: .markdown, documentURL: nil)
+    XCTAssertTrue(LargeDocument.isLarge(request.markdown.utf8.count))
+    let start = ContinuousClock.now
+    pipeline.submit(request, initial: false)
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertLessThan(
+      ContinuousClock.now - start, .milliseconds(500),
+      "a deferred render must not monopolize the main actor")
+    await pipeline.waitForPendingRender()
+    XCTAssertEqual(sink.received.count, 1, "the background render must still reach the preview")
+  }
+
+  @MainActor
+  func testBackgroundRenderCoalescesAndNeverPublishesSupersededText() async throws {
+    let started = expectation(description: "first render started")
+    let release = DispatchSemaphore(value: 0)
+    defer { release.signal() }
+    let rendered = Mutex<[String]>([])
+    let sink = RecordingPreviewSink()
+    let pipeline = PreviewPipeline(
+      themeManager: ThemeManager(defaults: makeEphemeralDefaults(prefix: "PreviewCoalescing")),
+      debounce: .milliseconds(1),
+      renderBody: { request in
+        XCTAssertFalse(Thread.isMainThread)
+        rendered.withLock { $0.append(request.markdown) }
+        if request.markdown == "first" {
+          started.fulfill()
+          release.wait()
+        }
+        return "<p>\(request.markdown)</p>"
+      })
+    pipeline.attach(sink: sink)
+    defer { pipeline.detach() }
+    func request(_ text: String) -> PreviewRenderRequest {
+      PreviewRenderRequest(markdown: text, fontSize: 14, theme: .markdown, documentURL: nil)
+    }
+    pipeline.submit(request("first"), initial: false)
+    await fulfillment(of: [started], timeout: 2)
+    pipeline.submit(request("second"), initial: false)
+    try await Task.sleep(for: .milliseconds(20))
+    pipeline.submit(request("third"), initial: false)
+    try await Task.sleep(for: .milliseconds(20))
+    XCTAssertEqual(rendered.withLock { $0 }, ["first"], "only one parser may run at a time")
+    release.signal()
+    await pipeline.waitForPendingRender()
+    XCTAssertEqual(rendered.withLock { $0 }, ["first", "third"])
+    XCTAssertEqual(sink.received.map(\.bodyHTML), ["<p>third</p>"])
+  }
+
+  @MainActor
+  func testDetachedRenderCannotPublishIntoNewAttachment() async throws {
+    let started = expectation(description: "render started")
+    let release = DispatchSemaphore(value: 0)
+    defer { release.signal() }
+    let pipeline = PreviewPipeline(
+      themeManager: ThemeManager(defaults: makeEphemeralDefaults(prefix: "PreviewDetach")),
+      debounce: .milliseconds(1),
+      renderBody: { _ in
+        started.fulfill()
+        release.wait()
+        return "<p>retired document</p>"
+      })
+    let original = RecordingPreviewSink()
+    let next = RecordingPreviewSink()
+    pipeline.attach(sink: original)
+    pipeline.submit(
+      PreviewRenderRequest(markdown: "old", fontSize: 14, theme: .markdown, documentURL: nil),
+      initial: false)
+    await fulfillment(of: [started], timeout: 2)
+    pipeline.detach()
+    pipeline.attach(sink: next)
+    release.signal()
+    await pipeline.waitForPendingRender()
+    XCTAssertTrue(original.received.isEmpty)
+    XCTAssertTrue(next.received.isEmpty)
+    pipeline.detach()
   }
 
   // MARK: - Pipeline scheduling

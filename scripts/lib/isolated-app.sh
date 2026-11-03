@@ -11,6 +11,7 @@
 ISOLATED_APP_PRODUCTION_BUNDLE_ID="io.vetcoders.pensieve"
 ISOLATED_APP_PRODUCTION_KEYCHAIN_SERVICE="io.vetcoders.pensieve.completion-provider"
 ISOLATED_APP_KEYCHAIN_ACCOUNT="api-key"
+ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT="codescribe_keychain_bundle_v1"
 ISOLATED_APP_TRUSTED_TEAM_IDENTIFIER="MW223P3NPX"
 ISOLATED_APP_REQUIRED_BUILD_CONFIGURATION="release"
 ISOLATED_APP_REQUIRED_BUILD_ARCHITECTURE="arm64"
@@ -1752,6 +1753,13 @@ isolated_app_assert_profile_fresh() {
       "fresh profile has residual or unreadable UUID-owned state: $bundle_id (status=$namespace_status)"
     return 1
   fi
+  if isolated_app_keychain_item_exists "$keychain_service" "$ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT"; then
+    isolated_app_error "fresh profile has residual agent credentials: $bundle_id"
+    return 1
+  else
+    query_status=$?
+    [[ "$query_status" -eq 1 ]] || return 1
+  fi
   if isolated_app_launchservices_registration_exists "$bundle_id"; then
     isolated_app_error \
       "fresh profile already has a LaunchServices registration: $bundle_id"
@@ -1917,6 +1925,8 @@ isolated_app_insert_manifest_coordinates() {
   isolated_app_plist_insert_string "$plist" keychainService "$keychain_service" || return 1
   isolated_app_plist_insert_string "$plist" keychainAccount "$ISOLATED_APP_KEYCHAIN_ACCOUNT" \
     || return 1
+  isolated_app_plist_insert_string "$plist" agentKeychainAccount "$ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT" \
+    || return 1
   isolated_app_plist_insert_string "$plist" preferencesPath "$preferences" || return 1
   isolated_app_plist_insert_string "$plist" recentDocumentsPath "$recent" || return 1
   isolated_app_plist_insert_string "$plist" savedStatePath "$saved" || return 1
@@ -2021,7 +2031,7 @@ isolated_app_reserve_manifest() {
 
   while :; do
     /usr/bin/plutil -create xml1 -- "$partial" >/dev/null 2>&1 || break
-    /usr/bin/plutil -insert schemaVersion -integer 5 -- "$partial" >/dev/null 2>&1 || break
+    /usr/bin/plutil -insert schemaVersion -integer 6 -- "$partial" >/dev/null 2>&1 || break
     isolated_app_plist_insert_string "$partial" manifestState reservation || break
     isolated_app_insert_manifest_coordinates \
       "$partial" "$owner_root" "$source_bundle" "$source_commit" "$bundle_path" \
@@ -2160,7 +2170,7 @@ isolated_app_validate_manifest_coordinates() {
   local manifest="${1:-}"
   local expected_owner_root="${2:-}"
   local expected_state="${3:-}"
-  local expected_schema="${4:-5}"
+  local expected_schema="${4:-6}"
   local schema state owner source_bundle source_commit nonce
   local bundle_path partial_bundle_path executable_name executable_path bundle_id
   local bundle_name display_name support_dir service account
@@ -2178,7 +2188,7 @@ isolated_app_validate_manifest_coordinates() {
     "$expected_owner_root" "$manifest" "identity manifest" || return 1
   schema="$(isolated_app_manifest_value "$manifest" schemaVersion)" || return 1
   state="$(isolated_app_manifest_value "$manifest" manifestState 2>/dev/null)" || state=""
-  [[ "$expected_schema" == "4" || "$expected_schema" == "5" ]] || return 1
+  [[ "$expected_schema" == "4" || "$expected_schema" == "5" || "$expected_schema" == "6" ]] || return 1
   [[ "$schema" == "$expected_schema" && "$state" == "$expected_state" ]] \
     || {
       isolated_app_error "identity manifest schema or state does not match $expected_state"
@@ -2196,6 +2206,10 @@ isolated_app_validate_manifest_coordinates() {
   support_dir="$(isolated_app_manifest_value "$manifest" supportPath)" || return 1
   service="$(isolated_app_manifest_value "$manifest" keychainService)" || return 1
   account="$(isolated_app_manifest_value "$manifest" keychainAccount)" || return 1
+  if [[ "$expected_schema" == "6" ]]; then
+    [[ "$(isolated_app_manifest_value "$manifest" agentKeychainAccount)" \
+      == "$ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT" ]] || return 1
+  fi
   nonce="$(isolated_app_manifest_value "$manifest" reservationNonce 2>/dev/null)" || nonce=""
   [[ "$owner" == "$expected_owner_root" && "$source_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
   isolated_app_assert_bundle_path "$source_bundle" || return 1
@@ -2248,8 +2262,8 @@ isolated_app_validate_manifest_coordinates() {
 
   # Schema 4 already had authenticated two-phase cleanup authority, but it
   # predates the Darwin C/T coordinates. Keep it usable for cleanup only. New
-  # reservation, finalization, launch, and verification remain schema 5.
-  if [[ "$expected_schema" == "5" ]]; then
+  # reservation, finalization, launch, and verification require schema 6.
+  if [[ "$expected_schema" == "5" || "$expected_schema" == "6" ]]; then
     darwin_cache_root="$(isolated_app_darwin_user_directory cache)" || return 1
     darwin_temp_root="$(isolated_app_darwin_user_directory temp)" || return 1
     [[ "$(isolated_app_manifest_value "$manifest" darwinUserCacheDirectory)" \
@@ -2284,11 +2298,18 @@ isolated_app_validate_cleanup_manifest() {
   schema="$(isolated_app_manifest_value "$manifest" schemaVersion)" || return 1
   state="$(isolated_app_manifest_value "$manifest" manifestState 2>/dev/null)" || state=""
   case "$schema/$state" in
-    5/reservation)
+    6/reservation)
       isolated_app_validate_reservation "$manifest" "$expected_owner_root"
       ;;
-    5/finalized)
+    6/finalized)
       isolated_app_validate_manifest "$manifest" "$expected_owner_root"
+      ;;
+    5/reservation)
+      isolated_app_validate_manifest_coordinates "$manifest" "$expected_owner_root" reservation 5
+      ;;
+    5/finalized)
+      isolated_app_validate_manifest_coordinates "$manifest" "$expected_owner_root" finalized 5 \
+        && isolated_app_validate_manifest_payload "$manifest"
       ;;
     4/reservation)
       isolated_app_validate_manifest_coordinates \
@@ -2329,7 +2350,7 @@ isolated_app_validate_manifest() {
   local manifest="${1:-}"
   local expected_owner_root="${2:-}"
   isolated_app_validate_manifest_coordinates \
-    "$manifest" "$expected_owner_root" finalized 5 || return 1
+    "$manifest" "$expected_owner_root" finalized 6 || return 1
   isolated_app_validate_manifest_payload "$manifest"
 }
 
@@ -2420,7 +2441,7 @@ isolated_app_cleanup_manifest() {
   support_dir="$(isolated_app_manifest_value "$manifest" supportPath)" || return 1
   service="$(isolated_app_manifest_value "$manifest" keychainService)" || return 1
   account="$(isolated_app_manifest_value "$manifest" keychainAccount)" || return 1
-  if [[ "$schema" == "5" ]]; then
+  if [[ "$schema" == "5" || "$schema" == "6" ]]; then
     darwin_cache_root="$(isolated_app_manifest_value \
       "$manifest" darwinUserCacheDirectory)" || return 1
     darwin_temp_root="$(isolated_app_manifest_value \
@@ -2436,6 +2457,10 @@ isolated_app_cleanup_manifest() {
     "$bundle_id" "$bundle_path" "$support_dir" "$service" "$expected_owner_root" "$account" \
     "$darwin_cache_root" "$darwin_temp_root" \
     || return 1
+  if [[ "$schema" == "6" ]]; then
+    isolated_app_reset_keychain_item \
+      "$bundle_id" "$service" "$ISOLATED_APP_AGENT_KEYCHAIN_ACCOUNT" || return 1
+  fi
   # Re-census the explicit manifest coordinates immediately before retiring
   # cleanup authority. A recreated C payload or malformed T shell keeps the
   # manifest intact for a safe retry.

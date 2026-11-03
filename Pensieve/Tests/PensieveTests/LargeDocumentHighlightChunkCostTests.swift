@@ -48,7 +48,8 @@ final class LargeDocumentHighlightChunkCostTests: XCTestCase {
 
   /// The other flavour: almost no code, a megabyte of prose the markdown regexes
   /// have to walk. The leading fence is what makes the edit a fence-touching one
-  /// — without it the debounce takes the scoped path, which was never the bug.
+  /// — without it the debounce takes the scoped path. The plain-prose load pin
+  /// below covers that separate route around the chunk budget.
   private func makeHugeProseDocument() -> String {
     let text =
       "```text\nplaceholder\n```\n\n"
@@ -138,6 +139,28 @@ final class LargeDocumentHighlightChunkCostTests: XCTestCase {
   }
 
   // MARK: - The cost invariant
+
+  func testPlainProseLoadAbsorbsItsUnboundedDebounce() {
+    let (content, storage) = makeStorage()
+    let text = String(repeating: "A plain paragraph with **bold** text.\n\n", count: 20_000)
+    loadWithoutSweeping(text, into: content, storage)
+    defer { content.scheduleRethemeChunk = MarkdownTextStorage.timerRethemeChunkScheduler }
+
+    XCTAssertGreaterThan(storage.length, MarkdownTextStorage.maximumRethemeChunkLength)
+    XCTAssertGreaterThan(content.longestSynchronousHighlightLength, 0)
+    XCTAssertLessThanOrEqual(
+      content.longestSynchronousHighlightLength, MarkdownTextStorage.maximumRethemeChunkLength,
+      "the load debounce must not repaint all plain prose after viewport-first rendering")
+    XCTAssertTrue(content.isRethemeSweepInFlight)
+    pump(content)
+    XCTAssertFalse(content.isRethemeSweepInFlight)
+    XCTAssertEqual(storage.string, text)
+    XCTAssertNotNil(
+      storage.attribute(.foregroundColor, at: storage.length - 2, effectiveRange: nil),
+      "absorbing the debounce must still paint the document tail")
+    XCTAssertLessThanOrEqual(
+      content.longestSynchronousHighlightLength, MarkdownTextStorage.maximumRethemeChunkLength)
+  }
 
   /// THE pin, code-block flavour. RED-FIRST against the pre-cut code: the
   /// debounced refresh painted all ~1.3 MB in one turn, five times the ceiling

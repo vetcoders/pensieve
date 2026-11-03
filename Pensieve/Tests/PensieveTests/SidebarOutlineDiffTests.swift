@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import SwiftUI
 import XCTest
 
 @testable import Pensieve
@@ -10,6 +12,46 @@ import XCTest
 /// A stale tree for a moment is legal; a beachball is not.
 @MainActor
 final class SidebarOutlineDiffTests: XCTestCase {
+  func testNativeListDoesNotBuildEveryConditionalRowToDiscoverRowCounts() {
+    let fixture = makeExpandedTree(folderCount: 50, documentsPerFolder: 100)
+    let rows = flattenWorkspaceTree(fixture.tree, expandedNodeIDs: fixture.expandedNodeIDs)
+    let probe = ListRowProbe()
+    let host = NSHostingView(
+      rootView: SidebarWorkspaceList(rows: rows) { row in
+        probe.content(for: row)
+      })
+    host.frame = NSRect(x: 0, y: 0, width: 260, height: 500)
+    // No NSWindow, ordering, desktop profile or native presentation. This still
+    // reaches SwiftUI's actual OutlineListCoordinator and its row census.
+    host.layoutSubtreeIfNeeded()
+
+    let outline = findOutline(in: host)
+    XCTAssertNotNil(outline, "the probe must reach the native outline, not just the flatten")
+    XCTAssertEqual(outline?.numberOfRows, rows.count, "every flattened row must remain navigable")
+    XCTAssertLessThan(
+      probe.count, 100,
+      "a 500pt list must not construct 5,050 conditional rows to count its children")
+    // Ask AppKit for both ends of the list. Laziness must preserve real cells
+    // and the ability to reach a document beyond the initial viewport.
+    let firstCell = outline?.view(atColumn: 0, row: 0, makeIfNecessary: true)
+    let lastCell = outline?.view(atColumn: 0, row: rows.count - 1, makeIfNecessary: true)
+    firstCell?.layoutSubtreeIfNeeded()
+    lastCell?.layoutSubtreeIfNeeded()
+    XCTAssertNotNil(firstCell)
+    XCTAssertNotNil(lastCell)
+    XCTAssertGreaterThan(probe.count, 0, "real cell requests must evaluate row content")
+    XCTAssertLessThan(probe.count, 100, "two cell requests must not realize the whole workspace")
+    print("[pensieve-trace] native-sidebar rows=\(rows.count) rowBodies=\(probe.count)")
+  }
+
+  private func findOutline(in view: NSView) -> NSOutlineView? {
+    if let outline = view as? NSOutlineView { return outline }
+    for child in view.subviews {
+      if let outline = findOutline(in: child) { return outline }
+    }
+    return nil
+  }
+
   func testPublishDoesNotFlattenUnderMainActorAssumeIsolated() throws {
     let probe = FlattenProbe()
     let store = WorkspaceTreeSnapshotStore(flatten: probe.flatten)
@@ -171,6 +213,26 @@ final class SidebarOutlineDiffTests: XCTestCase {
     }
     return (tree, expandedNodeIDs)
   }
+}
+
+@MainActor
+private final class ListRowProbe {
+  var count = 0
+
+  @ViewBuilder
+  func content(for row: FlattenedWorkspaceRow) -> some View {
+    let _ = record()
+    // Match the shipped workspaceRowView's conditional result shape.
+    if row.node.kind == .document {
+      Button(row.node.name) {}.onHover { _ in }
+    } else if row.node.kind == .foreignFile {
+      Text(row.node.name)
+    } else {
+      Button(row.node.name) {}
+    }
+  }
+
+  private func record() { count += 1 }
 }
 
 /// Records how often and on which thread the snapshot store invokes its flatten

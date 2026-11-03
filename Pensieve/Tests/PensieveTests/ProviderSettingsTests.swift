@@ -99,7 +99,7 @@ final class ProviderSettingsTests: XCTestCase {
 
       XCTAssertEqual(settings.endpoint, testCase.expected, "input: \(testCase.input)")
       XCTAssertEqual(
-        environment.values["LLM_ASSISTIVE_ENDPOINT"], testCase.expected,
+        environment.values["PENSIEVE_COMPLETION_ENDPOINT"], testCase.expected,
         "input: \(testCase.input)")
       XCTAssertFalse(
         environment.setCalls.contains { $0.value.contains("/chat/completions") },
@@ -112,7 +112,7 @@ final class ProviderSettingsTests: XCTestCase {
         environment: restoredEnvironment)
       XCTAssertEqual(restored.endpoint, testCase.expected, "input: \(testCase.input)")
       XCTAssertEqual(
-        restoredEnvironment.values["LLM_ASSISTIVE_ENDPOINT"], testCase.expected,
+        restoredEnvironment.values["PENSIEVE_COMPLETION_ENDPOINT"], testCase.expected,
         "persisted input: \(testCase.input)")
     }
   }
@@ -120,7 +120,9 @@ final class ProviderSettingsTests: XCTestCase {
   func testAnthropicMessagesPersistsAndAppliesNativeRuntimeShape() throws {
     let defaults = makeDefaults()
     let keychain = InMemoryProviderAPIKeyStore()
-    let environment = InMemoryProviderEnvironment()
+    let environment = InMemoryProviderEnvironment(values: [
+      "LLM_ASSISTIVE_PROVIDER": "xai-responses"
+    ])
     let settings = ProviderSettings(
       defaults: defaults, keychain: keychain, environment: environment)
     settings.providerShape = .anthropicMessages
@@ -132,12 +134,13 @@ final class ProviderSettingsTests: XCTestCase {
     try settings.save()
 
     XCTAssertEqual(settings.endpoint, "https://api.anthropic.com/v1/messages")
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_PROVIDER"], "anthropic-messages")
+    XCTAssertEqual(environment.values["PENSIEVE_COMPLETION_PROVIDER"], "anthropic-messages")
+    XCTAssertEqual(environment.values["LLM_ASSISTIVE_PROVIDER"], "xai-responses")
     XCTAssertEqual(
-      environment.values["LLM_ASSISTIVE_ENDPOINT"],
+      environment.values["PENSIEVE_COMPLETION_ENDPOINT"],
       "https://api.anthropic.com/v1/messages")
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_MODEL"], "claude-model")
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_API_KEY"], "anthropic-secret")
+    XCTAssertEqual(environment.values["PENSIEVE_COMPLETION_MODEL"], "claude-model")
+    XCTAssertEqual(environment.values["PENSIEVE_COMPLETION_API_KEY"], "anthropic-secret")
     XCTAssertEqual(keychain.apiKey, "anthropic-secret")
 
     let restored = ProviderSettings(
@@ -160,10 +163,10 @@ final class ProviderSettingsTests: XCTestCase {
     try settings.save()
 
     XCTAssertEqual(
-      environment.values["LLM_ASSISTIVE_ENDPOINT"],
+      environment.values["PENSIEVE_COMPLETION_ENDPOINT"],
       "https://provider.example/v1/responses")
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_MODEL"], "completion-model")
-    XCTAssertEqual(environment.values["LLM_ASSISTIVE_API_KEY"], secret)
+    XCTAssertEqual(environment.values["PENSIEVE_COMPLETION_MODEL"], "completion-model")
+    XCTAssertEqual(environment.values["PENSIEVE_COMPLETION_API_KEY"], secret)
     XCTAssertEqual(keychain.apiKey, secret)
 
     let persistedValues = Array(defaults.persistentDomain(forName: suiteName)?.values ?? [:].values)
@@ -203,7 +206,7 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertEqual(inheritedEnvironment.values["LLM_ENDPOINT"], "https://developer.example/v1")
     XCTAssertEqual(inheritedEnvironment.values["LLM_MODEL"], "developer-model")
     XCTAssertNil(
-      inheritedEnvironment.values["LLM_ASSISTIVE_API_KEY"],
+      inheritedEnvironment.values["PENSIEVE_COMPLETION_API_KEY"],
       "a saved key must never be paired automatically with an inherited provider")
   }
 
@@ -296,8 +299,8 @@ final class ProviderSettingsTests: XCTestCase {
     try settings.forgetSavedAPIKey()
 
     XCTAssertNil(keychain.apiKey)
-    XCTAssertNil(environment.values["LLM_ASSISTIVE_API_KEY"])
-    XCTAssertTrue(environment.removeCalls.contains("LLM_ASSISTIVE_API_KEY"))
+    XCTAssertNil(environment.values["PENSIEVE_COMPLETION_API_KEY"])
+    XCTAssertTrue(environment.removeCalls.contains("PENSIEVE_COMPLETION_API_KEY"))
   }
 
   func testOnboardingCoordinatorPresentsAtMostOnceAcrossWindowContexts() {

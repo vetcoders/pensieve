@@ -363,7 +363,9 @@ final class GrokAccountTests: XCTestCase {
       AskReadiness.chipLabel(for: account.snapshot.askProvider(apiKey: "")), "Grok ready")
 
     await account.useGrokForAsk()
-    XCTAssertEqual(bridge.laneWrites, ["xai-responses"], "already on Grok writes the lane once")
+    XCTAssertEqual(
+      bridge.laneWrites, ["xai-responses", "xai-responses"],
+      "an explicit choice must reach the engine even if the previous snapshot matched")
     XCTAssertTrue(account.snapshot.askUsesGrok)
     XCTAssertNil(account.lastError)
   }
@@ -406,7 +408,7 @@ final class GrokAccountTests: XCTestCase {
     XCTAssertEqual(account.snapshot.askProvider(apiKey: "sk-ant"), .apiKey("sk-ant"))
   }
 
-  func testChoosingTheAPIKeyProviderOffGrokWritesNothing() async {
+  func testChoosingTheAPIKeyProviderOffGrokStillHonorsTheExplicitChoice() async {
     let bridge = FakeCodescribeAccountBridge(signedIn: true, laneProviderID: "openai-responses")
     let account = GrokAccount(bridge: bridge, signInAllowed: true)
     await account.refresh()
@@ -414,8 +416,8 @@ final class GrokAccountTests: XCTestCase {
     await account.useAPIKeyProviderForAsk(.anthropicMessages)
 
     XCTAssertEqual(
-      bridge.laneWrites, [],
-      "codescribe's settings.json is shared; Pensieve writes the lane only to leave Grok")
+      bridge.laneWrites, ["anthropic-messages"],
+      "a stale Grok snapshot must not discard an explicit API-key selection")
     XCTAssertFalse(account.snapshot.askUsesGrok)
   }
 
@@ -430,6 +432,21 @@ final class GrokAccountTests: XCTestCase {
     XCTAssertEqual(
       account.lastError, "Could not switch the Ask provider: unknown provider: xai-responses")
     XCTAssertFalse(account.snapshot.askUsesGrok)
+  }
+
+  func testRefusedSwitchDoesNotPersistANewPreference() async {
+    let suite = "pensieve.tests.failed-ask-switch.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    GrokAccount.pinAccount(CodexAccount.providerID, defaults: defaults)
+    let bridge = FakeCodescribeAccountBridge(
+      signedIn: true, laneError: CsError.Config(msg: "write refused"))
+    let account = GrokAccount(bridge: bridge, laneChoiceDefaults: defaults)
+    await account.refresh()
+    await account.useGrokForAsk()
+    XCTAssertEqual(GrokAccount.pinnedAccountProvider(defaults), CodexAccount.providerID)
+    XCTAssertFalse(account.snapshot.askUsesGrok)
+    XCTAssertNotNil(account.lastError)
   }
 
   // MARK: - Refresh and isolation
