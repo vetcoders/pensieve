@@ -578,12 +578,19 @@ final class AutocompleteControllerTests: XCTestCase {
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
     controller.textDidChange(prefix: "hello")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil {
+      attempts.value == 1
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
+    }
     XCTAssertEqual(attempts.value, 1)
 
     controller.cancel()
+    XCTAssertNil(controller.lastError)
     controller.textDidChange(prefix: "hello again")
-    try? await Task.sleep(nanoseconds: 80_000_000)
+    await waitUntil {
+      attempts.value == 2
+        && controller.lastError == AutocompleteController.completionProviderUnavailableMessage
+    }
 
     XCTAssertEqual(attempts.value, 2, "cancel() must re-open the deliberate retry path")
   }
