@@ -9,6 +9,35 @@ import XCTest
 /// config listing `grok, codex, gemini` — the CLI reports effective members
 /// `[grok, codex]` and the dead `gemini` under `unsupported_configured`.
 enum WorkflowCapabilitiesFixtures {
+  static func launchOptions() throws -> WorkflowCapabilities {
+    var object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(isolatedGeminiJSON.utf8)) as? [String: Any])
+    object["providers"] = [
+      "codex": ["model_override": ["supported": true, "reason": ""]],
+      "junie": ["model_override": ["supported": false, "reason": "unsupported by this build"]],
+    ]
+    object["environments"] = [
+      "local-native": [
+        "label": "Living Tree", "available": true, "reason": "",
+        "skill_launcher_supported": true, "skill_launcher_flags": [],
+      ],
+      "local-worktrees": [
+        "label": "Fleet Worktrees", "available": true, "reason": "",
+        "skill_launcher_supported": true,
+        "skill_launcher_flags": ["--worktree", "true"],
+      ],
+      "local-vm": [
+        "label": "Fleet VM local", "available": false, "reason": "interactive only",
+        "skill_launcher_supported": false, "skill_launcher_flags": [],
+      ],
+      "cloud-soon": [
+        "label": "Fleet VM cloud", "available": false, "reason": "coming soon",
+        "skill_launcher_supported": false, "skill_launcher_flags": [],
+      ],
+    ]
+    return try WorkflowCapabilities.decode(from: JSONSerialization.data(withJSONObject: object))
+  }
+
   static let isolatedGeminiJSON = """
     {
       "agents": ["agy", "claude", "codex", "grok", "junie", "swarm"],
@@ -121,6 +150,23 @@ final class FakeWorkflowCapabilitiesProvider: WorkflowCapabilitiesProviding, Sen
 }
 
 final class WorkflowCapabilitiesTests: XCTestCase {
+  func testProviderModelAndDistinctRuntimeCapabilitiesSurviveDecoding() throws {
+    let capabilities = try WorkflowCapabilitiesFixtures.launchOptions()
+    XCTAssertTrue(capabilities.supportsModelOverride(agent: "codex"))
+    XCTAssertFalse(capabilities.supportsModelOverride(agent: "junie"))
+    XCTAssertFalse(capabilities.supportsModelOverride(agent: "unknown"))
+    XCTAssertTrue(capabilities.supportsWorktreeOverride(true))
+    XCTAssertTrue(capabilities.supportsWorktreeOverride(false))
+    XCTAssertEqual(capabilities.environments.count, 4)
+    XCTAssertEqual(capabilities.environments["local-vm"]?.label, "Fleet VM local")
+    XCTAssertEqual(capabilities.environments["cloud-soon"]?.available, false)
+  }
+
+  func testOlderCapabilitiesDoNotInventAdvancedLaunchSupport() throws {
+    let capabilities = try WorkflowCapabilitiesFixtures.decoded()
+    XCTAssertFalse(capabilities.supportsModelOverride(agent: "codex"))
+    XCTAssertFalse(capabilities.supportsWorktreeOverride(true))
+  }
 
   // MARK: - Versioned decoding (fail closed, never guess)
 

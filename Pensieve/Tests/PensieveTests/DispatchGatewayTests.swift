@@ -637,6 +637,50 @@ final class DispatchGatewayTests: XCTestCase {
   // MARK: - Helpers
 
   @MainActor
+  func testConfirmedDispatchCarriesModelAndWorktreeToTheCanonicalLauncher() async throws {
+    let provider = FakeWorkflowCapabilitiesProvider(
+      result: .success(try WorkflowCapabilitiesFixtures.launchOptions()))
+    let (controller, _, launcher) = makeController(capabilities: provider)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+    let intent = DispatchIntent(
+      subject: .unsavedBuffer(title: "Plan", text: "Implement this plan"),
+      workflow: "implement", source: .toolbar)
+    let options = AgentDispatchOptions(model: "gpt-6.1-sol", worktree: true)
+    _ = await controller.confirmDispatch(
+      intent: intent, workflow: "implement", agents: ["codex"],
+      rootURL: URL(fileURLWithPath: "/tmp/workspace"), options: options,
+      allowsExternalDispatch: true)
+    XCTAssertEqual(launcher.requests().count, 1)
+    XCTAssertEqual(launcher.requests().first?.options, options)
+    XCTAssertEqual(launcher.requests().first?.payload, intent.payload)
+    XCTAssertEqual(controller.agentWorkflows, ["implement", "research", "marbles"])
+  }
+
+  @MainActor
+  func testUnsupportedModelOrRuntimeRefusesBeforeLaunching() async throws {
+    var capabilities = try WorkflowCapabilitiesFixtures.launchOptions()
+    capabilities.environments.removeValue(forKey: "local-worktrees")
+    let provider = FakeWorkflowCapabilitiesProvider(result: .success(capabilities))
+    let (controller, _, launcher) = makeController(capabilities: provider)
+    controller.refreshWorkflowCapabilities(force: true)
+    try await waitForCapabilityState(controller)
+    let intent = DispatchIntent(
+      subject: .unsavedBuffer(title: "Plan", text: "Implement this plan"),
+      workflow: "implement", source: .toolbar)
+    for options in [
+      AgentDispatchOptions(model: "chosen-model"), AgentDispatchOptions(worktree: true),
+    ] {
+      let outcome = await controller.confirmDispatch(
+        intent: intent, workflow: "implement", agents: ["junie"],
+        rootURL: URL(fileURLWithPath: "/tmp/workspace"), options: options,
+        allowsExternalDispatch: true)
+      guard case .failure = outcome else { return XCTFail("Unsupported options must refuse") }
+    }
+    XCTAssertTrue(launcher.requests().isEmpty)
+  }
+
+  @MainActor
   private func makeController(
     capabilities: WorkflowCapabilitiesProviding? = nil,
     launcherResult: AgentDispatchMetadata? = nil
@@ -694,6 +738,7 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, Sendable {
     let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
+    var options = AgentDispatchOptions()
   }
 
   private struct State: Sendable {
@@ -710,7 +755,8 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, Sendable {
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata {
     state.withLock { state in
       state.recordedRequests.append(
@@ -718,7 +764,7 @@ private final class GatewayRecordingLauncher: AgentPromptLaunching, Sendable {
           workflow: workflow,
           agents: agents,
           payload: payload,
-          workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
+          workingDirectoryURL: workingDirectoryURL.standardizedFileURL, options: options))
     }
     return result
       ?? AgentDispatchMetadata(
@@ -748,7 +794,8 @@ private final class BlockingLauncher: AgentPromptLaunching, Sendable {
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata {
     state.withLock { state in
       state.started += 1

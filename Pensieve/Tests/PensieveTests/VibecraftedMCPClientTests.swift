@@ -5,6 +5,80 @@ import XCTest
 @testable import Pensieve
 
 final class VibecraftedMCPClientTests: XCTestCase {
+  func testExplicitModelAndWorktreeRemainTypedInTheToolRequest() throws {
+    let transport = FakeVibecraftedMCPTransport(probeStatus: .connected)
+    let client = makeClient(
+      pointing: MemoryVibecraftedMCPPointing(), transport: transport,
+      isExecutable: { _ in true })
+    for worktree in [true, false] {
+      _ = try client.dispatch(
+        workflow: "implement", agents: ["codex"], payload: .prompt("bounded plan"),
+        workingDirectoryURL: URL(fileURLWithPath: "/tmp/workspace"),
+        options: AgentDispatchOptions(model: " gpt-6.1-sol ", worktree: worktree))
+      let arguments = try XCTUnwrap(transport.toolCalls().last?.arguments)
+      XCTAssertEqual(arguments["model"], .string("gpt-6.1-sol"))
+      XCTAssertEqual(arguments["worktree"], .bool(worktree))
+    }
+  }
+
+  func testStdioSchemaGateRefusesOldServerAndPreservesBooleanOnUpdatedServer() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pensieve-mcp-options-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = directory.appendingPathComponent("server.py")
+    let schema = directory.appendingPathComponent("schema.json")
+    let calls = directory.appendingPathComponent("calls.json")
+    try """
+    #!/usr/bin/env python3
+    import json, sys
+    from pathlib import Path
+    root = Path(__file__).parent
+    for line in sys.stdin:
+        request = json.loads(line)
+        method = request.get("method")
+        if method == "notifications/initialized":
+            continue
+        if method == "initialize":
+            result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fixture", "version": "1"}}
+        elif method == "tools/list":
+            result = {"tools": [{"name": "vc_run_launch", "inputSchema": {"type": "object", "properties": json.loads((root / "schema.json").read_text())}}]}
+        elif method == "tools/call":
+            (root / "calls.json").write_text(json.dumps(request["params"]["arguments"]))
+            result = {"content": [{"type": "text", "text": json.dumps({"ok": True, "run_id": "fixture-run"})}]}
+        else:
+            raise RuntimeError(method)
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    let transport = StdioVibecraftedMCPTransport()
+    let arguments: [String: VibecraftedMCPValue] = [
+      "skill": "implement", "model": "gpt-6.1-sol", "worktree": .bool(true),
+    ]
+    try "{}".write(to: schema, atomically: true, encoding: .utf8)
+    let refused = try transport.callTool(
+      commandPath: script.path, name: "vc_run_launch", arguments: arguments)
+    XCTAssertEqual(refused["ok"] as? Bool, false)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
+    try #"{"model":{"type":"string"},"worktree":{"type":"string"}}"#
+      .write(to: schema, atomically: true, encoding: .utf8)
+    let wrongType = try transport.callTool(
+      commandPath: script.path, name: "vc_run_launch", arguments: arguments)
+    XCTAssertEqual(wrongType["ok"] as? Bool, false)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
+    try #"{"model":{"type":"string"},"worktree":{"anyOf":[{"type":"boolean"},{"type":"null"}]}}"#
+      .write(to: schema, atomically: true, encoding: .utf8)
+    let accepted = try transport.callTool(
+      commandPath: script.path, name: "vc_run_launch", arguments: arguments)
+    XCTAssertEqual(accepted["ok"] as? Bool, true)
+    let wire = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf: calls)) as? [String: Any])
+    XCTAssertEqual(wire["model"] as? String, "gpt-6.1-sol")
+    XCTAssertEqual(wire["worktree"] as? Bool, true)
+    XCTAssertNil(wire["worktree"] as? String)
+  }
+
   func testStatusIsNotConfiguredWhenNothingIsPointedOrDetected() {
     let transport = FakeVibecraftedMCPTransport(probeStatus: .connected)
     let client = makeClient(
@@ -118,7 +192,7 @@ final class VibecraftedMCPClientTests: XCTestCase {
     XCTAssertEqual(arguments["agent"], "grok")
     XCTAssertEqual(arguments["file"], "/tmp/plan.md")
     XCTAssertEqual(arguments["runtime"], "headless")
-    XCTAssertEqual(arguments["root"], root.path)
+    XCTAssertEqual(arguments["root"], .string(root.path))
     XCTAssertNil(arguments["prompt"])
   }
 
@@ -197,7 +271,7 @@ final class FakeVibecraftedMCPTransport: VibecraftedMCPTransporting, @unchecked 
   struct ToolCall: Equatable, Sendable {
     let commandPath: String
     let name: String
-    let arguments: [String: String]
+    let arguments: [String: VibecraftedMCPValue]
   }
 
   private struct State: Sendable {
@@ -230,7 +304,7 @@ final class FakeVibecraftedMCPTransport: VibecraftedMCPTransporting, @unchecked 
   func callTool(
     commandPath: String,
     name: String,
-    arguments: [String: String]
+    arguments: [String: VibecraftedMCPValue]
   ) throws -> [String: Any] {
     state.withLock {
       $0.calls.append(

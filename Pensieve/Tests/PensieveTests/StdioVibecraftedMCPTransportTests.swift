@@ -133,7 +133,7 @@ final class StdioVibecraftedMCPTransportTests: XCTestCase {
     XCTAssertThrowsError(
       try transport().callTool(
         commandPath: fixture.path, name: "fixture",
-        arguments: ["prompt": String(repeating: "x", count: 1024 * 1024)]))
+        arguments: ["prompt": .string(String(repeating: "x", count: 1024 * 1024))]))
     XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3.5)
     try fixture.assertStopped()
   }
