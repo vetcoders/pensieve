@@ -90,7 +90,8 @@ final class AskContextToolTests: XCTestCase {
     )
 
     let agent = ToolCallingAgent()
-    let thread = WorkspaceAskThread(identity: nestedIdentity, makeAgent: { agent })
+    let thread = AskThread(
+      context: AskContext(roots: [fixture.root, nestedRoot]), makeAgent: { agent })
     let host = await thread.makeHost(documents: [outerRef, innerRef], database: database)
     XCTAssertTrue(thread.send(text: "alpha beta", host: host, provider: .apiKey("test-key")))
     try await waitUntil { !thread.isStreaming }

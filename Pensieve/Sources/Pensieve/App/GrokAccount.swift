@@ -255,6 +255,10 @@ enum GrokLoginFailure: Equatable, Sendable {
     case .Agent(let msg), .Config(let msg), .Recording(let msg), .License(let msg),
       .Quality(let msg), .Runtime(let msg):
       return msg
+    case .CalibrationRefused:
+      // Carries a refusal code, not a sentence, and its errorDescription is
+      // the enum dump. Account sign-in never runs guided calibration.
+      return "Microphone calibration was refused."
     }
   }
 }
