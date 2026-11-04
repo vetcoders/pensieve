@@ -423,6 +423,24 @@ final class ProviderSettingsTests: XCTestCase {
     XCTAssertNil(controller.lastError)
   }
 
+  func testProviderSettingsIsConfiguredWithOAuthAccountWithoutAPIKeyOrManualEndpoint() {
+    let defaults = makeDefaults()
+    let environment = InMemoryProviderEnvironment(values: [
+      "LLM_OPENAI_ACCOUNT_TOKENS": #"{"provider":"openai-responses","access_token":"codex-tok"}"#
+    ])
+    let settings = ProviderSettings(
+      defaults: defaults,
+      keychain: InMemoryProviderAPIKeyStore(),
+      environment: environment)
+
+    XCTAssertTrue(settings.isOAuthAccountSignedIn)
+    XCTAssertTrue(settings.isConfigured)
+    XCTAssertEqual(settings.activeOAuthProviderDisplayName, "Codex (OpenAI account)")
+    XCTAssertEqual(settings.endpoint, "")
+    XCTAssertEqual(settings.model, "")
+    XCTAssertEqual(settings.apiKey, "")
+  }
+
   private func responsesEndpointCases() -> [(input: String, expected: String)] {
     let expected = "https://api.libraxis.cloud/v1/responses"
     return [

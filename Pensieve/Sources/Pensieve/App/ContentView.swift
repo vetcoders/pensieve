@@ -193,9 +193,9 @@ struct ContentView: View {
       NotificationCenter.default.publisher(
         for: .completionProviderSettingsDidChange)
     ) { notification in
-      guard let settings = notification.object as? ProviderSettings,
-        settings === providerSettings
-      else {
+      if let settings = notification.object as? ProviderSettings,
+        settings !== providerSettings
+      {
         return
       }
       providerOnboardingCoordinator.setProviderConfigured(providerSettings.isConfigured)

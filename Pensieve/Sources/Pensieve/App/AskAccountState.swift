@@ -103,12 +103,15 @@ final class AskAccountState {
         break
       }
       await readSnapshot()
+      NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: nil)
     }
     pending = Task { _ = try? await task.value }
     try await task.value
   }
 
   private func readSnapshot() async {
+    let previousSignedIn =
+      (snapshot?.grok.isSignedIn ?? false) || (snapshot?.codex.isSignedIn ?? false)
     let bridge = self.bridge
     guard
       let read = try? await Self.offMain({
@@ -125,6 +128,10 @@ final class AskAccountState {
     }
     grok.askUsesCodex = codex.askUsesCodex
     snapshot = Snapshot(grok: grok, codex: codex)
+    let nowSignedIn = grok.isSignedIn || codex.isSignedIn
+    if previousSignedIn != nowSignedIn {
+      NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: nil)
+    }
   }
 
   nonisolated private static func offMain<T: Sendable>(
