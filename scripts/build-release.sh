@@ -18,6 +18,7 @@
 # Usage:
 #   ./scripts/build-release.sh            # full pipeline
 #   ./scripts/build-release.sh --no-notarize   # local-only signed build
+#   ./scripts/build-release.sh --no-publish    # notarized .app + DMG, nothing published
 #   ./scripts/build-release.sh --clean    # nuke dist/ first
 #   ./scripts/build-release.sh --dmg-only # only (re)build DMG from existing stapled .app
 #   ./scripts/build-release.sh --no-dmg   # build + sign the .app only, skip the DMG step
@@ -85,6 +86,7 @@ DO_NOTARIZE=1
 DO_CLEAN=0
 DMG_ONLY=0
 DO_DMG=1
+DO_PUBLISH=1
 APPSTORE=0
 for arg in "$@"; do
     case "$arg" in
@@ -92,6 +94,7 @@ for arg in "$@"; do
         --clean)       DO_CLEAN=1 ;;
         --dmg-only)    DMG_ONLY=1 ;;
         --no-dmg)      DO_DMG=0 ;;
+        --no-publish)  DO_PUBLISH=0 ;;
         --appstore)    APPSTORE=1 ;;
         -h|--help)
             head -48 "$0" | grep -E "^#" | sed 's/^# \?//'
@@ -134,13 +137,18 @@ else
 fi
 
 # A lane "publishes" when it produces the notarized DMG humans actually
-# download — the same condition that puts an artifact on the internal release
-# shelf below. Everything else (--no-dmg, --no-notarize, --appstore) is a local
-# or store-lane build, so it must NOT touch or gate on the public download page:
-# `make release-local` runs --no-notarize --no-dmg on a repo that deliberately
-# keeps an unfilled checksum placeholder in docs/index.html.
+# download and the caller did not ask to keep it local. Publishing is three
+# outputs that always go together: the checksum stamped into docs/index.html,
+# the GitHub release marked latest, and the copy on the internal release shelf.
+# Everything else (--no-dmg, --no-notarize, --no-publish, --appstore) is a
+# local or store-lane build, so it must NOT touch or gate on the public
+# download page: `make release-local` runs --no-notarize --no-dmg on a repo
+# that deliberately keeps an unfilled checksum placeholder in docs/index.html.
+# Notarizing is not publishing: `make release-local NOTARIZE=true` runs
+# --no-publish and gets a notarized, stapled .app and DMG that open cleanly on
+# another Mac, with none of the three outputs above.
 PUBLISHES_DMG=0
-if (( DO_DMG && DO_NOTARIZE )); then
+if (( DO_DMG && DO_NOTARIZE && DO_PUBLISH )); then
     PUBLISHES_DMG=1
 fi
 LANDING_PAGE="$REPO_ROOT/docs/index.html"
@@ -1065,12 +1073,13 @@ if (( PUBLISHES_DMG )); then
 fi
 
 # Internal release shelf (Codescribe convention: <root>/<App>/<version>/ with
-# the artifact + SHA256SUMS.txt). Notarized lane only — local --no-notarize
-# builds are not releases and must not land on the team shelf. A root that
-# exists but cannot be written (the volume is there, the mkdir is refused)
-# must not abort the GitHub publish that already happened above.
+# the artifact + SHA256SUMS.txt). Publishing lane only — local --no-notarize
+# and --no-publish builds are not releases and must not land on the team
+# shelf. A root that exists but cannot be written (the volume is there, the
+# mkdir is refused) must not abort the GitHub publish that already happened
+# above.
 INTERNAL_RELEASES_ROOT="${PENSIEVE_INTERNAL_RELEASES:-/Volumes/vc-workspace/_RELEASES}"
-if (( DO_NOTARIZE )); then
+if (( PUBLISHES_DMG )); then
     if [[ -d "$INTERNAL_RELEASES_ROOT" ]]; then
         INTERNAL_DIR="$INTERNAL_RELEASES_ROOT/$APP_NAME/$APP_VERSION"
         if mkdir -p "$INTERNAL_DIR"; then

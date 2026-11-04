@@ -118,6 +118,7 @@ test-scripts:  ## Shell-side unit tests (release script guards)
 	@$(SCRIPTS)/test-semgrep-native-window-contract.sh
 	@$(SCRIPTS)/test-ui-smoke-contract.sh
 	@$(SCRIPTS)/test-ffi-freshness.sh
+	@$(SCRIPTS)/test-release-local-notarize.sh
 
 .PHONY: test-semgrep-contract
 test-semgrep-contract:  ## Verify the Tests-only native-window presentation Semgrep rule
@@ -215,10 +216,25 @@ release: gates  ## Full signed + notarized .app + .dmg (gated by test+lint)
 release: ffi-check
 	@$(SCRIPTS)/build-release.sh
 
+# NOTARIZE=true makes release-local notarize and staple the .app and a DMG so
+# they open cleanly on another Mac. It still publishes nothing: no GitHub
+# release, no docs/index.html checksum, no internal shelf. `make release` is
+# the lane that publishes. The value is checked before the gates run.
+NOTARIZE ?= false
+ifneq ($(filter release-local run-release install-app,$(MAKECMDGOALS)),)
+ifeq ($(filter $(NOTARIZE),true false),)
+$(error NOTARIZE must be true or false, got: $(NOTARIZE))
+endif
+endif
+
 .PHONY: release-local
-release-local: gates  ## Build signed production-identity .app only (no launch)
+release-local: gates  ## Signed .app only; NOTARIZE=true adds a notarized DMG (publishes nothing)
 release-local: ffi-check
+ifeq ($(NOTARIZE),true)
+	@$(SCRIPTS)/build-release.sh --no-publish
+else
 	@$(SCRIPTS)/build-release.sh --no-notarize --no-dmg
+endif
 
 .PHONY: release-clean
 release-clean: clean gates  ## Clean + full release (gated, most reproducible)
