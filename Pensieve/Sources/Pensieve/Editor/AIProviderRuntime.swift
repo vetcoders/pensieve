@@ -39,27 +39,101 @@ struct AutocompleteContext: Equatable, Sendable {
 }
 
 /// Provider-neutral text runtime shared by editor completion and dictation AI
-/// transforms. OpenAI Responses and Anthropic Messages have deliberately
-/// separate request/header/response contracts behind this single task seam.
+/// transforms. Supports the 3-tier ecosystem chain:
+/// - Tier 1 (Primary): OAuth accounts (OpenAI Codex, xAI Grok, Google Gemini CCA)
+/// - Tier 2 (Secondary): Libraxis local Dragon tunnel (127.0.0.1:8100) -> Libraxis Cloud
+/// - Tier 3 (Tertiary): OpenRouter (openai/gpt-5.4-mini) and configured API-key providers
 final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteCompleting, AIRewriting,
   AITextResponding, Sendable
 {
   typealias RequestSender = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
 
+  static let libraxisLocalDefaultEndpoint = "http://127.0.0.1:8100/v1/responses"
+  static let libraxisCloudDefaultEndpoint = "https://api.libraxis.cloud/v1/responses"
+  static let libraxisDefaultModel = "PocketAiHub/Qwen3.8-27B-Abliterated-MTPLX-Optimized-Speed"
+  static let openRouterDefaultEndpoint = "https://openrouter.ai/api/v1/responses"
+  static let openRouterDefaultModel = "openai/gpt-5.4-mini"
+
+  static let libraxisLocalEndpointEnvironmentKeys = [
+    "PENSIEVE_LIBRAXIS_LOCAL_ENDPOINT",
+    "LLM_PRIMARY_ENDPOINT",
+    "VITE_PRIMARY_LLM_ENDPOINT",
+  ]
+  static let libraxisLocalModelEnvironmentKeys = [
+    "PENSIEVE_LIBRAXIS_LOCAL_MODEL",
+    "LLM_PRIMARY_MODEL",
+    "VITE_PRIMARY_LLM_MODEL",
+  ]
+  static let libraxisCloudEndpointEnvironmentKeys = [
+    "PENSIEVE_LIBRAXIS_CLOUD_ENDPOINT",
+    "LLM_FALLBACK_ENDPOINT",
+    "VITE_FALLBACK_LLM_ENDPOINT",
+  ]
+  static let libraxisCloudModelEnvironmentKeys = [
+    "PENSIEVE_LIBRAXIS_CLOUD_MODEL",
+    "LLM_FALLBACK_MODEL",
+    "VITE_FALLBACK_LLM_MODEL",
+  ]
+  static let libraxisAPIKeyEnvironmentKeys = [
+    "LIBRAXIS_API_KEY",
+    "LLM_LIBRAXIS_API_KEY",
+    "VITE_LIBRAXIS_API_KEY",
+    "VITE_PRIMARY_LLM_KEY",
+    "VITE_FALLBACK_LLM_KEY",
+  ]
+  static let openRouterEndpointEnvironmentKeys = [
+    "PENSIEVE_OPENROUTER_ENDPOINT",
+    "LLM_TERTIARY_ENDPOINT",
+    "VITE_TERTIARY_LLM_ENDPOINT",
+  ]
+  static let openRouterModelEnvironmentKeys = [
+    "PENSIEVE_OPENROUTER_MODEL",
+    "OPENROUTER_MODEL",
+    "LLM_TERTIARY_MODEL",
+    "VITE_TERTIARY_LLM_MODEL",
+  ]
+  static let openRouterAPIKeyEnvironmentKeys = [
+    "OPENROUTER_API_KEY",
+    "LLM_OPENROUTER_API_KEY",
+    "VITE_TERTIARY_LLM_KEY",
+  ]
+  static let fallbackChainTriggerEnvironmentKeys =
+    [
+      "PENSIEVE_ENABLE_FALLBACK_CHAIN",
+      KeychainOAuthAccountTokenStore.bundleAccount,
+      "CODESCRIBE_KEYCHAIN_BUNDLE_V1",
+    ]
+    + OAuthAccountRuntime.activeProviderEnvironmentKeys
+    + OAuthAccountProvider.allCases.map(\.tokenEnvironmentKey)
+    + libraxisLocalEndpointEnvironmentKeys
+    + libraxisCloudEndpointEnvironmentKeys
+    + libraxisAPIKeyEnvironmentKeys
+    + openRouterEndpointEnvironmentKeys
+    + openRouterAPIKeyEnvironmentKeys
+
   private let environment: ProviderEnvironmentManaging
   private let keychain: ProviderAPIKeyStoring
+  private let oauthTokenStore: any OAuthAccountTokenStoring
   private let rewritePromptStore: RewritePromptStore
+  private let includeDefaultFallbackChain: Bool
+  private let laneChoiceSuiteName: String?
   private let sendRequest: RequestSender
 
   init(
     environment: ProviderEnvironmentManaging = ProcessProviderEnvironment(),
     keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
+    oauthTokenStore: (any OAuthAccountTokenStoring)? = nil,
     rewritePromptStore: RewritePromptStore = RewritePromptStore(),
+    includeDefaultFallbackChain: Bool = !AppSupportLocation.isRunningTests(),
+    laneChoiceSuiteName: String? = nil,
     sendRequest: RequestSender? = nil
   ) {
     self.environment = environment
     self.keychain = keychain
+    self.oauthTokenStore = oauthTokenStore ?? KeychainOAuthAccountTokenStore()
     self.rewritePromptStore = rewritePromptStore
+    self.includeDefaultFallbackChain = includeDefaultFallbackChain
+    self.laneChoiceSuiteName = laneChoiceSuiteName
     self.sendRequest =
       sendRequest ?? { request in
         try await Self.liveRequest(request)
@@ -67,8 +141,25 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
   }
 
   var isConfigured: Bool {
-    firstNonEmptyValue(for: ProviderSettings.endpointEnvironmentKeys) != nil
+    if firstNonEmptyValue(for: ProviderSettings.endpointEnvironmentKeys) != nil
       && firstNonEmptyValue(for: ProviderSettings.modelEnvironmentKeys) != nil
+    {
+      return true
+    }
+    if OAuthAccountRuntime.hasSignedInAccount(in: environment, tokenStore: oauthTokenStore) {
+      return true
+    }
+    if Self.hasFallbackChainEnvironment(in: environment) {
+      return true
+    }
+    return includeDefaultFallbackChain
+  }
+
+  static func hasFallbackChainEnvironment(
+    in environment: any ProviderEnvironmentManaging
+  ) -> Bool {
+    ProviderSettings.firstNonEmptyValue(for: fallbackChainTriggerEnvironmentKeys, in: environment)
+      != nil
   }
 
   func complete(context: AutocompleteContext, maxTokens: UInt32) async throws -> String {
@@ -88,56 +179,84 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     documentRevision: UInt64,
     replacementRange: NSRange
   ) async throws -> AICandidate {
-    let configuration = try resolveConfiguration()
-    let fingerprint = configuration.fingerprint
-    var preparedSession = session
-    preparedSession.prepare(for: fingerprint)
+    let configurations = try resolveConfigurationChain()
     let input = context.providerInput
-    let result: ProviderResult
-    var invalidatedOpaqueContinuation = false
-    do {
-      result = try await request(
-        configuration: configuration,
-        input: input,
-        instructions: Self.autocompleteInstructions(maxTokens: maxTokens),
-        maxTokens: maxTokens,
-        session: preparedSession,
-        useOpaqueContinuation: true)
-    } catch RuntimeError.invalidContinuation {
-      // An opaque Responses chain can expire server-side. Replay the explicit,
-      // accepted ledger exactly once and never retry a cancelled request.
-      try Task.checkCancellation()
-      invalidatedOpaqueContinuation = true
-      result = try await request(
-        configuration: configuration,
-        input: input,
-        instructions: Self.autocompleteInstructions(maxTokens: maxTokens),
-        maxTokens: maxTokens,
-        session: preparedSession,
-        useOpaqueContinuation: false)
+    let instructions = Self.autocompleteInstructions(maxTokens: maxTokens)
+    var lastError: (any Error)?
+
+    for configuration in configurations {
+      let fingerprint = configuration.fingerprint
+      let sameProvider =
+        session.providerFingerprint == nil || session.providerFingerprint == fingerprint
+      var preparedSession = session
+      preparedSession.prepare(for: fingerprint)
+      var invalidatedOpaqueContinuation = !sameProvider && session.continuation != .none
+
+      do {
+        let result: ProviderResult
+        do {
+          result = try await request(
+            configuration: configuration,
+            input: input,
+            instructions: instructions,
+            maxTokens: maxTokens,
+            session: preparedSession,
+            useOpaqueContinuation: sameProvider)
+        } catch RuntimeError.invalidContinuation {
+          // An opaque Responses chain can expire server-side. Replay the explicit,
+          // accepted ledger exactly once and never retry a cancelled request.
+          try Task.checkCancellation()
+          invalidatedOpaqueContinuation = true
+          result = try await request(
+            configuration: configuration,
+            input: input,
+            instructions: instructions,
+            maxTokens: maxTokens,
+            session: preparedSession,
+            useOpaqueContinuation: false)
+        }
+        return AICandidate(
+          documentID: session.documentID,
+          text: result.text,
+          providerInput: input,
+          providerFingerprint: fingerprint,
+          pendingContinuation: result.responseID.map(DocumentAIContinuation.openAI)
+            ?? .none,
+          invalidatedOpaqueContinuation: invalidatedOpaqueContinuation,
+          documentRevision: documentRevision,
+          replacementRange: replacementRange)
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        lastError = error
+      }
     }
-    return AICandidate(
-      documentID: session.documentID,
-      text: result.text,
-      providerInput: input,
-      providerFingerprint: fingerprint,
-      pendingContinuation: result.responseID.map(DocumentAIContinuation.openAI)
-        ?? .none,
-      invalidatedOpaqueContinuation: invalidatedOpaqueContinuation,
-      documentRevision: documentRevision,
-      replacementRange: replacementRange)
+
+    throw lastError
+      ?? VistaError.ModelError(msg: "completion LLM unavailable: endpoint and model are required")
   }
 
   func respond(input: String, instructions: String) async throws -> String {
-    let configuration = try resolveConfiguration()
-    return try await request(
-      configuration: configuration,
-      input: input,
-      instructions: instructions,
-      maxTokens: nil,
-      session: DocumentAISession(documentID: "dictation"),
-      useOpaqueContinuation: false
-    ).text
+    let configurations = try resolveConfigurationChain()
+    var lastError: (any Error)?
+    for configuration in configurations {
+      do {
+        return try await request(
+          configuration: configuration,
+          input: input,
+          instructions: instructions,
+          maxTokens: nil,
+          session: DocumentAISession(documentID: "dictation"),
+          useOpaqueContinuation: false
+        ).text
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        lastError = error
+      }
+    }
+    throw lastError
+      ?? VistaError.ModelError(msg: "completion LLM unavailable: endpoint and model are required")
   }
 
   func rewrite(
@@ -145,28 +264,46 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     intent: RewriteIntent,
     session: DocumentAISession
   ) async throws -> AICandidate {
-    let configuration = try resolveConfiguration()
-    let fingerprint = configuration.fingerprint
-    var preparedSession = session
-    preparedSession.prepare(for: fingerprint)
+    let configurations = try resolveConfigurationChain()
     let input = try Self.rewriteInput(context: context, intent: intent)
-    let result = try await request(
-      configuration: configuration,
-      input: input,
-      instructions: rewritePromptStore.instructions(for: intent),
-      maxTokens: nil,
-      session: preparedSession,
-      useOpaqueContinuation: false)
-    return AICandidate(
-      documentID: session.documentID,
-      text: result.text,
-      providerInput: input,
-      providerFingerprint: fingerprint,
-      pendingContinuation: result.responseID.map(DocumentAIContinuation.openAI) ?? .none,
-      invalidatedOpaqueContinuation: false,
-      documentRevision: context.documentRevision,
-      replacementRange: NSRange(
-        location: context.rangeLocation, length: context.rangeLength))
+    let instructions = rewritePromptStore.instructions(for: intent)
+    var lastError: (any Error)?
+
+    for configuration in configurations {
+      let fingerprint = configuration.fingerprint
+      let sameProvider =
+        session.providerFingerprint == nil || session.providerFingerprint == fingerprint
+      var preparedSession = session
+      preparedSession.prepare(for: fingerprint)
+      let invalidatedOpaqueContinuation = !sameProvider && session.continuation != .none
+
+      do {
+        let result = try await request(
+          configuration: configuration,
+          input: input,
+          instructions: instructions,
+          maxTokens: nil,
+          session: preparedSession,
+          useOpaqueContinuation: false)
+        return AICandidate(
+          documentID: session.documentID,
+          text: result.text,
+          providerInput: input,
+          providerFingerprint: fingerprint,
+          pendingContinuation: result.responseID.map(DocumentAIContinuation.openAI) ?? .none,
+          invalidatedOpaqueContinuation: invalidatedOpaqueContinuation,
+          documentRevision: context.documentRevision,
+          replacementRange: NSRange(
+            location: context.rangeLocation, length: context.rangeLength))
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        lastError = error
+      }
+    }
+
+    throw lastError
+      ?? VistaError.ModelError(msg: "completion LLM unavailable: endpoint and model are required")
   }
 
   private func request(
@@ -177,6 +314,18 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     session: DocumentAISession,
     useOpaqueContinuation: Bool
   ) async throws -> ProviderResult {
+    if case .oauth(let provider, let initialTokens) = configuration.auth {
+      return try await executeOAuthRequest(
+        provider: provider,
+        initialTokens: initialTokens,
+        endpoint: configuration.endpoint.absoluteString,
+        model: configuration.model,
+        input: input,
+        instructions: instructions,
+        session: session)
+    }
+
+    let resolvedAPIKey = try resolveAPIKey(for: configuration)
     var request = URLRequest(url: configuration.endpoint)
     request.httpMethod = "POST"
     request.timeoutInterval = 30
@@ -185,7 +334,7 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     do {
       switch configuration.shape {
       case .openAIResponses:
-        if let apiKey = configuration.apiKey {
+        if let apiKey = resolvedAPIKey {
           request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
           request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         }
@@ -210,7 +359,7 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
             instructions: instructions,
             previousResponseID: previousResponseID))
       case .anthropicMessages:
-        guard let apiKey = configuration.apiKey else {
+        guard let apiKey = resolvedAPIKey else {
           throw VistaError.ModelError(
             msg: "completion LLM unavailable: Anthropic API key is required")
         }
@@ -294,41 +443,320 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     }
   }
 
-  private func resolveConfiguration() throws -> Configuration {
-    guard let endpointValue = firstNonEmptyValue(for: ProviderSettings.endpointEnvironmentKeys),
-      let model = firstNonEmptyValue(for: ProviderSettings.modelEnvironmentKeys)
-    else {
+  private func executeOAuthRequest(
+    provider: OAuthAccountProvider,
+    initialTokens: OAuthAccountTokens,
+    endpoint: String,
+    model: String,
+    input: String,
+    instructions: String,
+    session: DocumentAISession
+  ) async throws -> ProviderResult {
+    var tokens = initialTokens
+    if tokens.isExpired(), tokens.refreshToken != nil {
+      tokens = try await refreshOAuthTokens(tokens, for: provider)
+    }
+
+    let (firstData, firstResponse) = try await sendSingleOAuthAttempt(
+      provider: provider,
+      tokens: tokens,
+      endpoint: endpoint,
+      model: model,
+      input: input,
+      instructions: instructions,
+      session: session)
+
+    let data: Data
+    let response: HTTPURLResponse
+    if firstResponse.statusCode == 401, tokens.refreshToken != nil {
+      try Task.checkCancellation()
+      tokens = try await refreshOAuthTokens(tokens, for: provider)
+      (data, response) = try await sendSingleOAuthAttempt(
+        provider: provider,
+        tokens: tokens,
+        endpoint: endpoint,
+        model: model,
+        input: input,
+        instructions: instructions,
+        session: session)
+    } else {
+      data = firstData
+      response = firstResponse
+    }
+
+    guard (200..<300).contains(response.statusCode) else {
+      let detail = Self.providerErrorMessage(from: data)
+      throw VistaError.ModelError(
+        msg: "completion request failed: HTTP \(response.statusCode): \(detail)")
+    }
+
+    switch provider {
+    case .openAIResponses, .xAIResponses:
+      let parsed = try OAuthAccountRuntime.parseCodexOrResponsesOutput(from: data)
+      guard !parsed.text.isEmpty else {
+        throw VistaError.ModelError(
+          msg: "completion response parse failed: response did not contain output text")
+      }
+      return ProviderResult(text: parsed.text, responseID: nil)
+    case .googleGemini:
+      let text = try OAuthAccountRuntime.parseGoogleCCAResponse(from: data)
+      guard !text.isEmpty else {
+        throw VistaError.ModelError(
+          msg: "completion response parse failed: response did not contain output text")
+      }
+      return ProviderResult(text: text, responseID: nil)
+    }
+  }
+
+  private func sendSingleOAuthAttempt(
+    provider: OAuthAccountProvider,
+    tokens: OAuthAccountTokens,
+    endpoint: String,
+    model: String,
+    input: String,
+    instructions: String,
+    session: DocumentAISession
+  ) async throws -> (Data, HTTPURLResponse) {
+    let inputItems = Self.replayedResponsesDictionaries(
+      session.acceptedTurns, currentInput: input)
+    let request: URLRequest
+    switch provider {
+    case .openAIResponses:
+      request = try OAuthAccountRuntime.buildCodexRequest(
+        endpoint: endpoint,
+        model: model,
+        tokens: tokens,
+        inputItems: inputItems,
+        instructions: instructions,
+        timeoutInterval: 30)
+    case .xAIResponses:
+      request = try OAuthAccountRuntime.buildXAIRequest(
+        endpoint: endpoint,
+        model: model,
+        tokens: tokens,
+        inputItems: inputItems,
+        instructions: instructions,
+        timeoutInterval: 30)
+    case .googleGemini:
+      request = try OAuthAccountRuntime.buildGoogleCCARequest(
+        endpoint: endpoint,
+        model: model,
+        tokens: tokens,
+        acceptedTurns: session.acceptedTurns,
+        input: input,
+        instructions: instructions,
+        environment: environment,
+        timeoutInterval: 30)
+    }
+
+    do {
+      return try await sendRequest(request)
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch let error as URLError where error.code == .cancelled || Task.isCancelled {
+      throw CancellationError()
+    } catch {
+      throw VistaError.ModelError(
+        msg: "completion request failed: \(Self.singleLine(error.localizedDescription))")
+    }
+  }
+
+  private func refreshOAuthTokens(
+    _ current: OAuthAccountTokens,
+    for provider: OAuthAccountProvider
+  ) async throws -> OAuthAccountTokens {
+    do {
+      let updated = try await OAuthAccountRuntime.refreshTokens(
+        current,
+        for: provider,
+        environment: environment,
+        timeoutInterval: 15,
+        sendRequest: sendRequest)
+      oauthTokenStore.saveTokens(updated, for: provider, environment: environment)
+      return updated
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch let error as URLError where error.code == .cancelled || Task.isCancelled {
+      throw CancellationError()
+    } catch let error as VistaError {
+      throw error
+    } catch {
+      throw VistaError.ModelError(
+        msg: "completion request failed: \(Self.singleLine(error.localizedDescription))")
+    }
+  }
+
+  private func resolveAPIKey(for configuration: Configuration) throws -> String? {
+    switch configuration.auth {
+    case .apiKey(let value):
+      return value
+    case .oauth:
+      return nil
+    case .lazyKeychainOrEnv(let shape):
+      let keySearch =
+        shape == .anthropicMessages
+        ? ProviderSettings.anthropicAPIKeyEnvironmentKeys + ProviderSettings.apiKeyEnvironmentKeys
+        : ProviderSettings.apiKeyEnvironmentKeys
+      var apiKey = firstNonEmptyValue(for: keySearch)
+      let isLocalEndpoint =
+        configuration.endpoint.host == "localhost"
+        || configuration.endpoint.host == "127.0.0.1"
+        || configuration.endpoint.host == "::1"
+      if apiKey == nil, !isLocalEndpoint {
+        apiKey = try keychain.loadAPIKey()
+      }
+      return apiKey
+    }
+  }
+
+  private func resolveConfigurationChain() throws -> [Configuration] {
+    let defaults =
+      laneChoiceSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? UserDefaults.standard
+    let apiKeyPinned = GrokAccount.apiKeyLaneIsPinned(defaults)
+
+    var oauthCandidates: [Configuration] = []
+    for provider in OAuthAccountRuntime.orderedProviders(in: environment, defaults: defaults) {
+      guard
+        let tokens = oauthTokenStore.loadTokens(for: provider, environment: environment),
+        tokens.hasUsableCredentials
+      else { continue }
+      let endpointString = provider.resolveEndpoint(tokens: tokens, environment: environment)
+      guard let endpoint = Self.validatedHTTPURL(endpointString) else { continue }
+      let model = provider.resolveModel(environment: environment)
+      oauthCandidates.append(
+        Configuration(
+          shape: .openAIResponses,
+          endpoint: endpoint,
+          model: model,
+          auth: .oauth(provider: provider, tokens: tokens)))
+    }
+
+    var explicitCandidate: Configuration?
+    var explicitError: VistaError?
+    let rawEndpoint = firstNonEmptyValue(for: ProviderSettings.endpointEnvironmentKeys)
+    let rawModel = firstNonEmptyValue(for: ProviderSettings.modelEnvironmentKeys)
+    if let rawEndpoint, let rawModel {
+      let explicitShape = firstNonEmptyValue(for: ProviderSettings.providerShapeEnvironmentKeys)
+        .flatMap(CompletionProviderShape.init(rawValue:))
+      let shape =
+        explicitShape
+        ?? ProviderSettings.providerShape(in: environment, endpoint: rawEndpoint)
+      let normalizedEndpoint = shape.normalizeEndpoint(rawEndpoint)
+      if let endpoint = Self.validatedHTTPURL(normalizedEndpoint) {
+        explicitCandidate = Configuration(
+          shape: shape,
+          endpoint: endpoint,
+          model: rawModel,
+          auth: .lazyKeychainOrEnv(shape: shape))
+      } else {
+        explicitError = VistaError.ModelError(
+          msg: "completion LLM unavailable: endpoint is invalid")
+      }
+    }
+
+    let enableFallbacks =
+      includeDefaultFallbackChain
+      || Self.hasFallbackChainEnvironment(in: environment)
+      || !oauthCandidates.isEmpty
+
+    var fallbackCandidates: [Configuration] = []
+    if enableFallbacks {
+      // Tier 2A: Libraxis Local (Dragon tunnel 127.0.0.1:8100 -> PocketAiHub/Qwen3.8-27B-Abliterated-MTPLX-Optimized-Speed)
+      let localEndpointRaw =
+        firstNonEmptyValue(for: Self.libraxisLocalEndpointEnvironmentKeys)
+        ?? Self.libraxisLocalDefaultEndpoint
+      let localModel =
+        firstNonEmptyValue(for: Self.libraxisLocalModelEnvironmentKeys)
+        ?? Self.libraxisDefaultModel
+      let libraxisKey = firstNonEmptyValue(for: Self.libraxisAPIKeyEnvironmentKeys)
+      if let localURL = Self.validatedHTTPURL(
+        CompletionProviderShape.openAIResponses.normalizeEndpoint(localEndpointRaw))
+      {
+        fallbackCandidates.append(
+          Configuration(
+            shape: .openAIResponses,
+            endpoint: localURL,
+            model: localModel,
+            auth: .apiKey(libraxisKey)))
+      }
+
+      // Tier 2B: Libraxis Cloud (https://api.libraxis.cloud/v1/responses)
+      let cloudEndpointRaw =
+        firstNonEmptyValue(for: Self.libraxisCloudEndpointEnvironmentKeys)
+        ?? Self.libraxisCloudDefaultEndpoint
+      let cloudModel =
+        firstNonEmptyValue(for: Self.libraxisCloudModelEnvironmentKeys)
+        ?? Self.libraxisDefaultModel
+      if let cloudURL = Self.validatedHTTPURL(
+        CompletionProviderShape.openAIResponses.normalizeEndpoint(cloudEndpointRaw))
+      {
+        fallbackCandidates.append(
+          Configuration(
+            shape: .openAIResponses,
+            endpoint: cloudURL,
+            model: cloudModel,
+            auth: .apiKey(libraxisKey)))
+      }
+
+      // Tier 3: OpenRouter (https://openrouter.ai/api/v1/responses, model openai/gpt-5.4-mini)
+      let openRouterEndpointRaw =
+        firstNonEmptyValue(for: Self.openRouterEndpointEnvironmentKeys)
+        ?? Self.openRouterDefaultEndpoint
+      let openRouterModel =
+        firstNonEmptyValue(for: Self.openRouterModelEnvironmentKeys)
+        ?? Self.openRouterDefaultModel
+      let openRouterKey = firstNonEmptyValue(for: Self.openRouterAPIKeyEnvironmentKeys)
+      if let openRouterURL = Self.validatedHTTPURL(
+        CompletionProviderShape.openAIResponses.normalizeEndpoint(openRouterEndpointRaw))
+      {
+        fallbackCandidates.append(
+          Configuration(
+            shape: .openAIResponses,
+            endpoint: openRouterURL,
+            model: openRouterModel,
+            auth: .apiKey(openRouterKey)))
+      }
+    }
+
+    var chain: [Configuration] = []
+    if apiKeyPinned {
+      if let explicitCandidate {
+        chain.append(explicitCandidate)
+      }
+      chain.append(contentsOf: oauthCandidates)
+      chain.append(contentsOf: fallbackCandidates)
+    } else if !oauthCandidates.isEmpty {
+      // Tier 1: OAuth accounts -> Tier 2: Libraxis -> Tier 3: OpenRouter & configured API key
+      chain.append(contentsOf: oauthCandidates)
+      chain.append(contentsOf: fallbackCandidates)
+      if let explicitCandidate {
+        chain.append(explicitCandidate)
+      }
+    } else {
+      if let explicitCandidate {
+        chain.append(explicitCandidate)
+      }
+      chain.append(contentsOf: fallbackCandidates)
+    }
+
+    if chain.isEmpty {
+      if let explicitError {
+        throw explicitError
+      }
       throw VistaError.ModelError(
         msg: "completion LLM unavailable: endpoint and model are required")
     }
+    return chain
+  }
 
-    let explicitShape = firstNonEmptyValue(for: ProviderSettings.providerShapeEnvironmentKeys)
-      .flatMap(CompletionProviderShape.init(rawValue:))
-    let shape = explicitShape ?? .openAIResponses
-    let normalizedEndpoint = shape.normalizeEndpoint(endpointValue)
-    guard let endpoint = URL(string: normalizedEndpoint),
-      let scheme = endpoint.scheme?.lowercased(),
+  private static func validatedHTTPURL(_ value: String) -> URL? {
+    guard let url = URL(string: value),
+      let scheme = url.scheme?.lowercased(),
       scheme == "https" || scheme == "http"
     else {
-      throw VistaError.ModelError(msg: "completion LLM unavailable: endpoint is invalid")
+      return nil
     }
-
-    let keySearch =
-      shape == .anthropicMessages
-      ? ProviderSettings.anthropicAPIKeyEnvironmentKeys + ProviderSettings.apiKeyEnvironmentKeys
-      : ProviderSettings.apiKeyEnvironmentKeys
-    var apiKey = firstNonEmptyValue(for: keySearch)
-    let isLocalEndpoint =
-      endpoint.host == "localhost" || endpoint.host == "127.0.0.1"
-      || endpoint.host == "::1"
-    if apiKey == nil, !isLocalEndpoint {
-      apiKey = try keychain.loadAPIKey()
-    }
-    return Configuration(
-      shape: shape,
-      endpoint: endpoint,
-      model: model,
-      apiKey: apiKey)
+    return url
   }
 
   private func firstNonEmptyValue(for keys: [String]) -> String? {
@@ -404,6 +832,27 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     return input
   }
 
+  private static func replayedResponsesDictionaries(
+    _ turns: [AcceptedAITurn], currentInput: String
+  ) -> [[String: Any]] {
+    var input: [[String: Any]] = []
+    for turn in turns {
+      input.append([
+        "role": "user",
+        "content": [["type": "input_text", "text": turn.input]],
+      ])
+      input.append([
+        "role": "assistant",
+        "content": [["type": "output_text", "text": turn.output]],
+      ])
+    }
+    input.append([
+      "role": "user",
+      "content": [["type": "input_text", "text": currentInput]],
+    ])
+    return input
+  }
+
   private static func replayedAnthropicMessages(
     _ turns: [AcceptedAITurn], currentInput: String
   ) -> [AnthropicMessage] {
@@ -465,11 +914,17 @@ extension AIProviderRuntime {
     case invalidContinuation
   }
 
-  fileprivate struct Configuration {
+  fileprivate enum CandidateAuth: Sendable {
+    case apiKey(String?)
+    case lazyKeychainOrEnv(shape: CompletionProviderShape)
+    case oauth(provider: OAuthAccountProvider, tokens: OAuthAccountTokens)
+  }
+
+  fileprivate struct Configuration: Sendable {
     let shape: CompletionProviderShape
     let endpoint: URL
     let model: String
-    let apiKey: String?
+    let auth: CandidateAuth
 
     var fingerprint: ProviderFingerprint {
       ProviderFingerprint(

@@ -992,6 +992,52 @@ final class AutocompleteControllerTests: XCTestCase {
     let reloaded = DocumentWindowModel(defaults: defaults)
     XCTAssertTrue(reloaded.aiAutocompleteEnabled)
   }
+
+  func testOAuthAccountSelectionClearsUnavailableLatchAndCompletesWithoutAPIKey() async {
+    let env = MutableAutocompleteTestEnvironment()
+    let suite = "pensieve.tests.autocomplete-oauth.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: env,
+      laneChoiceSuiteName: suite
+    ) { request in
+      let data = Data(
+        #"{"id":"resp_grok","status":"completed","output_text":" from oauth"}"#.utf8)
+      let response = HTTPURLResponse(
+        url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+      return (data, response)
+    }
+    let controller = AutocompleteController(
+      completionFactory: { runtime },
+      debounceNanoseconds: 1)
+
+    controller.textDidChange(prefix: "hello")
+    await waitUntil {
+      controller.lastError == AutocompleteController.completionProviderUnavailableMessage
+    }
+
+    try? env.setValue(
+      #"{"provider":"xai-responses","access_token":"grok-tok"}"#,
+      forKey: "LLM_XAI_ACCOUNT_TOKENS")
+    NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: nil)
+    await waitUntil { controller.lastError == nil }
+
+    controller.textDidChange(prefix: "hello again")
+    await waitUntil { controller.suggestion == " from oauth" }
+    XCTAssertEqual(controller.suggestion, " from oauth")
+    XCTAssertNil(controller.lastError)
+  }
+}
+
+private final class MutableAutocompleteTestEnvironment: ProviderEnvironmentManaging {
+  private let values = Mutex<[String: String]>([:])
+  func value(forKey key: String) -> String? { values.withLock { $0[key] } }
+  func setValue(_ value: String, forKey key: String) throws {
+    values.withLock { $0[key] = value }
+  }
+  func removeValue(forKey key: String) throws {
+    _ = values.withLock { $0.removeValue(forKey: key) }
+  }
 }
 
 private final class AttemptCounter: Sendable {

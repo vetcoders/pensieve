@@ -290,11 +290,11 @@ final class GrokAccount: ObservableObject {
   nonisolated static let providerID = "xai-responses"
   /// Set when the user explicitly hands Ask back to an API-key provider.
   /// Absent or false means a signed-in account may own Ask.
-  static let apiKeyLanePinnedKey = "pensieve.ask.apiKeyLanePinned"
+  nonisolated static let apiKeyLanePinnedKey = "pensieve.ask.apiKeyLanePinned"
   /// Provider id of the account the user explicitly chose for Ask
   /// (`xai-responses` or `openai-responses`). Empty means no account pin.
   /// An explicit pin blocks the other account from adopting the lane.
-  static let accountLanePinnedKey = "pensieve.ask.accountLanePinned"
+  nonisolated static let accountLanePinnedKey = "pensieve.ask.accountLanePinned"
   /// codescribe P2-09: the OAuth human step (a second screen, 2FA) routinely
   /// outlasts a short timeout. Five minutes matches the Codescribe app.
   nonisolated static let loginTimeoutSeconds: UInt64 = 300
@@ -490,11 +490,11 @@ final class GrokAccount: ObservableObject {
     await routeAsk(to: shape.rawValue, choice: .apiKey)
   }
 
-  static func apiKeyLaneIsPinned(_ defaults: UserDefaults?) -> Bool {
+  nonisolated static func apiKeyLaneIsPinned(_ defaults: UserDefaults?) -> Bool {
     defaults?.bool(forKey: apiKeyLanePinnedKey) == true
   }
 
-  static func pinnedAccountProvider(_ defaults: UserDefaults?) -> String? {
+  nonisolated static func pinnedAccountProvider(_ defaults: UserDefaults?) -> String? {
     let value = defaults?.string(forKey: accountLanePinnedKey) ?? ""
     return value.isEmpty ? nil : value
   }

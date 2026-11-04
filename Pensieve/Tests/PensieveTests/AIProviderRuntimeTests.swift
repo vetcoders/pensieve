@@ -377,6 +377,243 @@ final class AIProviderRuntimeTests: XCTestCase {
     XCTAssertEqual(content.first?["text"] as? String, "surowa transkrypcja")
   }
 
+  func testCodexOAuthPrimaryTierStreamsAndAggregatesSSEWithoutAPIKey() async throws {
+    let jwtClaims = try JSONSerialization.data(withJSONObject: [
+      "https://api.openai.com/auth": ["chatgpt_account_id": "acct_codex_42"]
+    ])
+    let jwtPayload =
+      jwtClaims.base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+    let fakeJWT = "eyJhbGciOiJub25lIn0.\(jwtPayload).sig"
+    let tokenJSON = """
+      {"provider":"openai-responses","access_token":"codex-oauth-token","id_token":"\(fakeJWT)"}
+      """
+    let environment = StubProviderEnvironment([
+      "LLM_OPENAI_ACCOUNT_TOKENS": tokenJSON
+    ])
+    let recorder = RequestRecorder()
+    let sseBody = """
+      event: response.created
+      data: {"type":"response.created","response":{"id":"resp_codex_1"}}
+
+      event: response.output_text.delta
+      data: {"type":"response.output_text.delta","delta":" from"}
+
+      event: response.output_text.delta
+      data: {"type":"response.output_text.delta","delta":" codex"}
+
+      event: response.completed
+      data: {"type":"response.completed","response":{"id":"resp_codex_1","status":"completed"}}
+
+      """
+    let suite = "pensieve.tests.oauth-codex.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      laneChoiceSuiteName: suite
+    ) { request in
+      recorder.record(request)
+      return (Data(sseBody.utf8), Self.response(for: request, statusCode: 200))
+    }
+
+    XCTAssertTrue(runtime.isConfigured)
+    let completion = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "Hello", afterCursor: ""),
+      maxTokens: 24)
+    XCTAssertEqual(completion, " from codex")
+
+    let request = try XCTUnwrap(recorder.request)
+    XCTAssertEqual(
+      request.url?.absoluteString, "https://chatgpt.com/backend-api/codex/responses")
+    XCTAssertEqual(
+      request.value(forHTTPHeaderField: "Authorization"), "Bearer codex-oauth-token")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-ID"), "acct_codex_42")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "OpenAI-Beta"), "responses=experimental")
+    XCTAssertEqual(request.value(forHTTPHeaderField: "originator"), "pensieve")
+    let body = try requestJSON(request)
+    XCTAssertEqual(body["model"] as? String, "gpt-5.4")
+    XCTAssertEqual(body["stream"] as? Bool, true)
+    XCTAssertEqual(body["store"] as? Bool, false)
+  }
+
+  func testXAIGrokOAuthPrimaryTierCompletesOverResponsesEndpoint() async throws {
+    let tokenJSON = #"{"provider":"xai-responses","access_token":"grok-oauth-token"}"#
+    let environment = StubProviderEnvironment([
+      "LLM_XAI_ACCOUNT_TOKENS": tokenJSON
+    ])
+    let recorder = RequestRecorder()
+    let suite = "pensieve.tests.oauth-grok.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      laneChoiceSuiteName: suite
+    ) { request in
+      recorder.record(request)
+      return (
+        Data(#"{"id":"resp_grok","status":"completed","output_text":" from grok"}"#.utf8),
+        Self.response(for: request, statusCode: 200)
+      )
+    }
+
+    let completion = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "Hello", afterCursor: ""),
+      maxTokens: 24)
+    XCTAssertEqual(completion, " from grok")
+    let request = try XCTUnwrap(recorder.request)
+    XCTAssertEqual(request.url?.absoluteString, "https://api.x.ai/v1/responses")
+    XCTAssertEqual(
+      request.value(forHTTPHeaderField: "Authorization"), "Bearer grok-oauth-token")
+    let body = try requestJSON(request)
+    XCTAssertEqual(body["model"] as? String, "grok-4.6")
+  }
+
+  func testGoogleGeminiOAuthPrimaryTierUsesCloudCodeAssistEnvelopeAndSkipsThoughtParts()
+    async throws
+  {
+    let tokenJSON = #"{"provider":"google-gemini","access_token":"gemini-oauth-token"}"#
+    let environment = StubProviderEnvironment([
+      "LLM_GOOGLE_ACCOUNT_TOKENS": tokenJSON
+    ])
+    let recorder = RequestRecorder()
+    let ccaResponse = """
+      {"response":{"candidates":[{"index":0,"content":{"parts":[{"text":"internal reasoning","thought":true},{"text":" from gemini"}]}}]}}
+      """
+    let suite = "pensieve.tests.oauth-gemini.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      laneChoiceSuiteName: suite
+    ) { request in
+      recorder.record(request)
+      return (Data(ccaResponse.utf8), Self.response(for: request, statusCode: 200))
+    }
+
+    let completion = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "Hello", afterCursor: ""),
+      maxTokens: 24)
+    XCTAssertEqual(completion, " from gemini")
+    let request = try XCTUnwrap(recorder.request)
+    XCTAssertEqual(
+      request.url?.absoluteString,
+      "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent")
+    XCTAssertEqual(
+      request.value(forHTTPHeaderField: "Authorization"), "Bearer gemini-oauth-token")
+    let body = try requestJSON(request)
+    XCTAssertEqual(body["project"] as? String, "rising-fact-p41fc")
+    XCTAssertEqual(body["model"] as? String, "gemini-2.5-flash")
+    XCTAssertEqual(body["userAgent"] as? String, "antigravity")
+    XCTAssertEqual(body["requestType"] as? String, "agent")
+  }
+
+  func testCodescribeKeychainBundleV1Base64DecodesAllThreeOAuthProviders() throws {
+    let rawBundle = """
+      {"version":1,"keys":{"LLM_OPENAI_ACCOUNT_TOKENS":"{\\"access_token\\":\\"oa-tok\\"}","LLM_XAI_ACCOUNT_TOKENS":"{\\"access_token\\":\\"xai-tok\\"}","LLM_GOOGLE_ACCOUNT_TOKENS":"{\\"access_token\\":\\"gg-tok\\",\\"project_id\\":\\"proj-9\\"}"}}
+      """
+    let b64Bundle = "b64:\(Data(rawBundle.utf8).base64EncodedString())"
+    let store = KeychainOAuthAccountTokenStore(
+      allowSystemKeychain: true,
+      keychainReader: { service, account in
+        guard service == KeychainOAuthAccountTokenStore.codescribeService,
+          account == KeychainOAuthAccountTokenStore.bundleAccount
+        else { return nil }
+        return b64Bundle
+      })
+    let env = StubProviderEnvironment([:])
+    XCTAssertEqual(
+      store.loadTokens(for: .openAIResponses, environment: env)?.accessToken, "oa-tok")
+    XCTAssertEqual(
+      store.loadTokens(for: .xAIResponses, environment: env)?.accessToken, "xai-tok")
+    let google = try XCTUnwrap(store.loadTokens(for: .googleGemini, environment: env))
+    XCTAssertEqual(google.accessToken, "gg-tok")
+    XCTAssertEqual(google.projectID, "proj-9")
+  }
+
+  func testThreeTierChainFailsOverFromOAuthToLibraxisLocalToLibraxisCloudToOpenRouter()
+    async throws
+  {
+    let environment = StubProviderEnvironment([
+      "LLM_XAI_ACCOUNT_TOKENS": #"{"provider":"xai-responses","access_token":"grok-tok"}"#,
+      "LIBRAXIS_API_KEY": "lx-key",
+      "OPENROUTER_API_KEY": "or-key",
+    ])
+    let recorder = RequestRecorder()
+    let sender = SequencedRequestSender(responses: [
+      (503, #"{"error":{"message":"xAI unavailable"}}"#),
+      (502, #"{"error":{"message":"dragon tunnel down"}}"#),
+      (502, #"{"error":{"message":"libraxis cloud down"}}"#),
+      (200, #"{"id":"resp_or","status":"completed","output_text":" from openrouter"}"#),
+    ])
+    let suite = "pensieve.tests.three-tier.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      includeDefaultFallbackChain: true,
+      laneChoiceSuiteName: suite
+    ) { request in
+      recorder.record(request)
+      return try sender.send(request)
+    }
+
+    let completion = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "Hello", afterCursor: ""),
+      maxTokens: 24)
+    XCTAssertEqual(completion, " from openrouter")
+    XCTAssertEqual(recorder.requests.count, 4)
+    XCTAssertEqual(recorder.requests[0].url?.absoluteString, "https://api.x.ai/v1/responses")
+    XCTAssertEqual(
+      recorder.requests[1].url?.absoluteString, "http://127.0.0.1:8100/v1/responses")
+    let localBody = try requestJSON(recorder.requests[1])
+    XCTAssertEqual(
+      localBody["model"] as? String,
+      "PocketAiHub/Qwen3.8-27B-Abliterated-MTPLX-Optimized-Speed")
+    XCTAssertEqual(
+      recorder.requests[2].url?.absoluteString, "https://api.libraxis.cloud/v1/responses")
+    XCTAssertEqual(
+      recorder.requests[3].url?.absoluteString, "https://openrouter.ai/api/v1/responses")
+    XCTAssertEqual(
+      recorder.requests[3].value(forHTTPHeaderField: "Authorization"), "Bearer or-key")
+    let openRouterBody = try requestJSON(recorder.requests[3])
+    XCTAssertEqual(openRouterBody["model"] as? String, "openai/gpt-5.4-mini")
+  }
+
+  func testOAuthRefreshesExpiredAccessTokenBeforeCompletionRequest() async throws {
+    let expiredTokenJSON = """
+      {"provider":"xai-responses","access_token":"expired-tok","refresh_token":"refresh-tok","expires_at_unix":100}
+      """
+    let environment = StubProviderEnvironment([
+      "LLM_XAI_ACCOUNT_TOKENS": expiredTokenJSON
+    ])
+    let recorder = RequestRecorder()
+    let sender = SequencedRequestSender(responses: [
+      (200, #"{"access_token":"refreshed-grok-tok","expires_in":3600}"#),
+      (200, #"{"id":"resp_refreshed","status":"completed","output_text":" refreshed output"}"#),
+    ])
+    let suite = "pensieve.tests.oauth-refresh.\(UUID().uuidString)"
+    defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+    let runtime = AIProviderRuntime(
+      environment: environment,
+      laneChoiceSuiteName: suite
+    ) { request in
+      recorder.record(request)
+      return try sender.send(request)
+    }
+
+    let completion = try await runtime.complete(
+      context: AutocompleteContext(beforeCursor: "Hello", afterCursor: ""),
+      maxTokens: 16)
+    XCTAssertEqual(completion, " refreshed output")
+    XCTAssertEqual(recorder.requests.count, 2)
+    XCTAssertEqual(
+      recorder.requests[0].url?.absoluteString, "https://oes.x.ai/oauth2/token")
+    XCTAssertEqual(
+      recorder.requests[1].url?.absoluteString, "https://api.x.ai/v1/responses")
+    XCTAssertEqual(
+      recorder.requests[1].value(forHTTPHeaderField: "Authorization"),
+      "Bearer refreshed-grok-tok")
+  }
+
   private static func response(for request: URLRequest, statusCode: Int) -> HTTPURLResponse {
     HTTPURLResponse(
       url: request.url!, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
