@@ -708,12 +708,12 @@ fi
 
 RELEASE_SCRIPT="$SCRIPT_DIR/build-release.sh"
 
-if grep -q 'if (( DO_DMG \&\& DO_NOTARIZE )); then' "$RELEASE_SCRIPT" \
+if grep -q 'if (( DO_DMG \&\& DO_NOTARIZE \&\& DO_PUBLISH )); then' "$RELEASE_SCRIPT" \
     && grep -q '^    PUBLISHES_DMG=1$' "$RELEASE_SCRIPT"; then
-    pass "the publishable lane is exactly DO_DMG && DO_NOTARIZE"
+    pass "the publishable lane is exactly DO_DMG && DO_NOTARIZE && DO_PUBLISH"
 else
-    fail "the publishable lane is exactly DO_DMG && DO_NOTARIZE" \
-        "no 'if (( DO_DMG && DO_NOTARIZE ))' / PUBLISHES_DMG=1 pair in build-release.sh"
+    fail "the publishable lane is exactly DO_DMG && DO_NOTARIZE && DO_PUBLISH" \
+        "no 'if (( DO_DMG && DO_NOTARIZE && DO_PUBLISH ))' / PUBLISHES_DMG=1 pair in build-release.sh"
 fi
 
 UNGUARDED="$(awk '

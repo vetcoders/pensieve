@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced by the shared surface above; the status bar, sidebar and editor
   invariants are unchanged, and Hide remains distinct from Stop.
 
+### Release engineering
+
+- `make release-local NOTARIZE=true` builds a notarized, stapled `.app` and
+  DMG that publish nothing: no GitHub release, no `docs/index.html` checksum,
+  no internal release shelf. Until now the only way to get a notarized DMG
+  was `make release` or `make notarize`, and both publish a GitHub release
+  marked latest. `build-release.sh --no-publish` is the underlying flag.
+  The internal shelf now follows the same publishing condition as the page
+  and GitHub, instead of notarization alone.
+
 ## [0.6.0] - 2026-09-29
 
 ### Added
