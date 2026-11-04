@@ -117,8 +117,16 @@ final class PR65ReviewProbes: XCTestCase {
     turn.text = "ab"
     model.observe(turns: [turn])
     now = 1
-    try await Task.sleep(for: .milliseconds(200))
-    await model.awaitParseWorker()
+    // The trailing flush is a real 110 ms timer, then a main-actor hop, then a
+    // parse. Wait for its effect rather than for a fixed time, so a loaded
+    // runner cannot read the document before the flush has run.
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.document(for: turn.id.uuidString)?.source != "ab",
+      ContinuousClock.now < deadline
+    {
+      try await Task.sleep(for: .milliseconds(20))
+      await model.awaitParseWorker()
+    }
     XCTAssertEqual(
       model.document(for: turn.id.uuidString)?.source, "ab",
       "A paused stream must flush its pending tail without another delta")

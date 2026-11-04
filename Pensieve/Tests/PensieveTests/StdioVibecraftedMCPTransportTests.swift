@@ -6,6 +6,21 @@ import XCTest
 
 /// Real pipes and disposable local executables, never the installed MCP server.
 final class StdioVibecraftedMCPTransportTests: XCTestCase {
+  /// The fixtures run under `/usr/bin/python3`. Its first launch on a cold
+  /// runner can outlast the 1.5 s deadlines below, so the client would kill
+  /// the child before the script's first line ran, and the test would measure
+  /// interpreter start-up instead of the transport. Pay that cost once here.
+  override class func setUp() {
+    super.setUp()
+    let warmUp = Process()
+    warmUp.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    warmUp.arguments = ["-c", "import json, os, signal, sys, threading, time"]
+    warmUp.standardOutput = FileHandle.nullDevice
+    warmUp.standardError = FileHandle.nullDevice
+    try? warmUp.run()
+    warmUp.waitUntilExit()
+  }
+
   func testSilentServerHonorsDeadlineAndReapsTermResistantChild() throws {
     let fixture = try server("signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(8)")
     defer { fixture.remove() }
