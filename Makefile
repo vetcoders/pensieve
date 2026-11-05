@@ -208,17 +208,142 @@ ffi-check:  ## Warn if vendored codescribe-ffi (and optional qube-ffi) provenanc
 	@$(PKG_DIR)/scripts/check-ffi-freshness.sh
 
 # =========================================================================
-# RELEASE PIPELINE
+# RELEASE / VERSION
 # =========================================================================
 
+PYTHON := $(shell command -v python3.14 2>/dev/null || command -v python3.13 2>/dev/null || command -v python3.12 2>/dev/null || command -v python3.11 2>/dev/null || command -v python3)
+APP_VERSION := $(shell tr -d '[:space:]' < $(REPO_ROOT)/VERSION 2>/dev/null || echo 0.0.0)
+COMMIT_SLUG := $(shell git -C $(REPO_ROOT) rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+BUILD_LABEL := $(APP_VERSION)+$(COMMIT_SLUG)
+TAG := v$(APP_VERSION)
+RELEASE_TAG := v$(BUILD_LABEL)
+VERSIONED_DMG := $(DIST)/Pensieve-$(BUILD_LABEL).dmg
+
+.PHONY: version
+version: version-show  ## Alias for version-show
+
+.PHONY: version-show
+version-show:  ## Show package version, build label, and tag state
+	@printf "package: Pensieve\n"
+	@printf "version: %s\n" "$(APP_VERSION)"
+	@printf "commit:  %s\n" "$(COMMIT_SLUG)"
+	@printf "label:   %s\n" "$(BUILD_LABEL)"
+	@printf "tag:     %s\n" "$(TAG)"
+	@if git rev-parse --verify "refs/tags/$(TAG)" >/dev/null 2>&1; then \
+		echo "tag-state: exists ($(TAG))"; \
+	elif git rev-parse --verify "refs/tags/$(RELEASE_TAG)" >/dev/null 2>&1; then \
+		echo "tag-state: exists ($(RELEASE_TAG))"; \
+	else \
+		echo "tag-state: missing"; \
+	fi
+
+.PHONY: version-check
+version-check:  ## Validate synced release surfaces (VERSION, docs/index.html, CHANGELOG.md)
+	@$(PYTHON) $(SCRIPTS)/release_sync.py check
+
+.PHONY: version-bump
+version-bump:  ## Bump VERSION and sync docs/index.html (VERSION={patch|minor|major|x.y.z})
+ifeq ($(origin VERSION),command line)
+	@$(PYTHON) $(SCRIPTS)/release_sync.py bump "$(VERSION)"
+else
+	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
+endif
+
+.PHONY: version-patch
+version-patch:  ## Alias for version-bump VERSION=patch
+	@$(MAKE) version-bump VERSION=patch
+
+.PHONY: bump-patch
+bump-patch:  ## Alias for version-bump VERSION=patch
+	@$(MAKE) version-bump VERSION=patch
+
+.PHONY: changelog-close
+changelog-close:  ## Close CHANGELOG.md '[Unreleased]' to current VERSION + date
+	@$(PYTHON) $(SCRIPTS)/changelog_close.py $(if $(CHANGELOG_GENERATE),--generate-if-empty)
+
+.PHONY: release-notes
+release-notes:  ## Print release notes body derived from CHANGELOG.md current version section
+	@$(PYTHON) $(SCRIPTS)/release_sync.py notes $(if $(origin VERSION),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: release-plan
+release-plan:  ## Print the full release and publish flow
+	@echo "Pensieve release flow"
+	@echo ""
+	@echo "1. Prepare the release surfaces:"
+	@echo "     make release-prepare VERSION={patch|minor|major|x.y.z}"
+	@echo "   (runs version-bump + changelog-close + version-check + release-notes preview + lint + test-scripts)"
+	@echo "2. Review diff, commit VERSION + CHANGELOG.md + docs/index.html."
+	@echo "3. Run strict release readiness gate:"
+	@echo "     make release-check"
+	@echo "4. Build, sign, notarize, and staple locally (publishes nothing):"
+	@echo "     make release"
+	@echo "5. Smoke-test the local notarized bundle:"
+	@echo "     make manual-smoke   # or: open dist/Pensieve.app"
+	@echo "6. Push commit/tag to origin and publish to GitHub Releases + docs/index.html + internal shelf:"
+	@echo "     git push origin HEAD"
+	@echo "     make publish"
+	@echo "7. Commit the stamped docs/index.html SHA-256 and push."
+
+.PHONY: release-prepare
+release-prepare:  ## version-bump + changelog-close + notes preview + precheck (VERSION={patch|minor|major|x.y.z})
+ifeq ($(origin VERSION),command line)
+	@$(MAKE) version-bump VERSION=$(VERSION)
+	@$(MAKE) changelog-close CHANGELOG_GENERATE=1
+	@$(MAKE) version-check
+	@mkdir -p $(DIST)
+	@$(PYTHON) $(SCRIPTS)/release_sync.py notes --output $(DIST)/release-notes.md
+	@$(MAKE) lint test-scripts
+else
+	@echo "VERSION is required. Usage: make release-prepare VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
+endif
+	@echo ""
+	@echo "=== Release prepared ==="
+	@echo "Next: review diff, commit, then:"
+	@echo "  make release-check"
+	@echo "  make release        # local signed + notarized .app + .dmg (publishes nothing)"
+	@echo "  git push origin HEAD"
+	@echo "  make publish        # stamp docs/index.html + GitHub Release + internal shelf"
+
+.PHONY: release-check
+release-check:  ## Strict release readiness gate (version-check + gates + ffi-check)
+	@$(PYTHON) $(SCRIPTS)/release_sync.py check --require-version-section
+	@$(MAKE) gates ffi-check
+	@printf "$(C_GREEN)[ ok ]$(C_RESET) Release readiness passed\n"
+
+.PHONY: release-tag
+release-tag:  ## Create annotated (or GPG-signed) tag from VERSION
+	@if git rev-parse --verify "refs/tags/$(TAG)" >/dev/null 2>&1; then \
+		echo "Tag $(TAG) already exists."; \
+		exit 1; \
+	fi
+	@key="$${LOCTREE_GPG_KEY_ID:-}"; \
+	if [ -n "$$key" ]; then \
+		pp="$${LOCTREE_GPG_PASSPHRASE_FILE:-$$HOME/.keys/.gpg.passphrase}"; \
+		if [ -r "$$pp" ]; then \
+			echo "warmup" | gpg --batch --pinentry-mode loopback --passphrase-file "$$pp" --local-user "$$key" --detach-sign -o /dev/null 2>/dev/null || true; \
+		fi; \
+		git tag -as -u "$$key" "$(TAG)" -m "Release $(TAG)"; \
+		echo "Created GPG-signed annotated tag $(TAG)"; \
+	else \
+		git tag -a "$(TAG)" -m "Release $(TAG)"; \
+		echo "Created annotated tag $(TAG)"; \
+	fi
+
+.PHONY: release-push
+release-push:  ## Push the current branch and release tag to origin
+	git push origin HEAD
+	@if git rev-parse --verify "refs/tags/$(TAG)" >/dev/null 2>&1; then \
+		git push origin "$(TAG)"; \
+	fi
+
 .PHONY: release
-release: gates  ## Full signed + notarized .app + .dmg (gated by test+lint)
+release: gates  ## Local signed + notarized .app + .dmg in dist/ (publishes nothing)
 release: ffi-check
 	@$(SCRIPTS)/build-release.sh
 
 # NOTARIZE=true makes release-local notarize and staple the .app and a DMG so
 # they open cleanly on another Mac. It still publishes nothing: no GitHub
-# release, no docs/index.html checksum, no internal shelf. `make release` is
+# release, no docs/index.html checksum, no internal shelf. `make publish` is
 # the lane that publishes. The value is checked before the gates run.
 NOTARIZE ?= false
 ifneq ($(filter release-local run-release install-app,$(MAKECMDGOALS)),)
@@ -237,13 +362,17 @@ else
 endif
 
 .PHONY: release-clean
-release-clean: clean gates  ## Clean + full release (gated, most reproducible)
+release-clean: clean gates  ## Clean + local signed + notarized .app + .dmg (publishes nothing)
 release-clean: ffi-check
 	@$(SCRIPTS)/build-release.sh --clean
 
 .PHONY: notarize
-notarize:  ## DMG-only: package + notarize + staple from the existing signed .app (no rebuild, no gates)
+notarize:  ## DMG-only: package + notarize + staple from existing signed .app (publishes nothing)
 	@$(SCRIPTS)/build-release.sh --dmg-only
+
+.PHONY: publish
+publish: ffi-check  ## Publish notarized DMG: stamp docs/index.html + GitHub Release (--latest) + internal shelf
+	@$(SCRIPTS)/build-release.sh --publish
 
 .PHONY: release-appstore
 release-appstore: gates  ## Mac App Store lane: sandbox-signed .app + .pkg in dist/mas (needs PENSIEVE_MAS_APP_IDENTITY)
@@ -329,8 +458,8 @@ help:  ## Show this help
 	@printf "\n$(C_CYAN)Pensieve$(C_RESET) — native macOS markdown editor\n"
 	@printf "$(C_CYAN)$$(printf '%.s─' {1..72})$(C_RESET)\n\n"
 	@awk 'BEGIN {FS = ":.*?## "} \
-		/^# =+$$/ { in_section=1; next } \
-		in_section && /^# / { sub(/^# /, ""); printf "\n  $(C_YELLOW)%s$(C_RESET)\n", $$0; in_section=0; next } \
+		/^# =+$$/ { in_section = !in_section; next } \
+		in_section && /^# / { sub(/^# /, ""); printf "\n  $(C_YELLOW)%s$(C_RESET)\n", $$0; next } \
 		/^[a-zA-Z][a-zA-Z0-9_?\\-]*:.*?##/ { \
 			target=$$1; gsub(/\\\?/, "?", target); \
 			printf "    $(C_GREEN)%-18s$(C_RESET) %s\n", target, $$2 \
@@ -340,5 +469,7 @@ help:  ## Show this help
 	@printf "    make test            # unit + integration tests\n"
 	@printf "    make ui-smoke        # automated ephemeral isolated UI smoke\n"
 	@printf "    make manual-smoke    # open a new clean manual test identity\n"
-	@printf "    make release         # signed + notarized .app + .dmg\n"
+	@printf "    make release-prepare # bump VERSION + close CHANGELOG + check surfaces\n"
+	@printf "    make release         # local signed + notarized .app + .dmg (publishes nothing)\n"
+	@printf "    make publish         # stamp docs/index.html + GitHub Release + internal shelf\n"
 	@printf "    make info-artifacts  # inspect dist/ contents\n\n"

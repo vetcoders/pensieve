@@ -5,6 +5,8 @@ All notable changes to Pensieve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.7.0] - 2026-10-04
 
 ### Added
@@ -57,13 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Release engineering
 
-- `make release-local NOTARIZE=true` builds a notarized, stapled `.app` and
-  DMG that publish nothing: no GitHub release, no `docs/index.html` checksum,
-  no internal release shelf. Until now the only way to get a notarized DMG
-  was `make release` or `make notarize`, and both publish a GitHub release
-  marked latest. `build-release.sh --no-publish` is the underlying flag.
-  The internal shelf now follows the same publishing condition as the page
-  and GitHub, instead of notarization alone.
+- `make release`, `make release-clean`, `make notarize`, and `make release-local NOTARIZE=true`
+  build, sign, notarize, and staple `.app` and DMG locally without publishing:
+  no GitHub release, no `docs/index.html` checksum rewrite, and no internal
+  release shelf copy (`DO_PUBLISH=0` by default in `scripts/build-release.sh`).
+  Outward publication is now explicit via `make publish` (`build-release.sh --publish`
+  or `--publish-only` when reusing an already-notarized local bundle/DMG for `HEAD`),
+  accompanied by `make release-prepare`, `make version-bump`, `make version-check`,
+  `make changelog-close`, `make release-notes`, `make release-plan`, `make release-check`,
+  `make release-tag`, and `make release-push`.
 
 ## [0.6.0] - 2026-09-29
 
