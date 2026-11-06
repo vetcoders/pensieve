@@ -109,7 +109,10 @@ final class WorkspaceStore {
   /// flatten, so every hover/selection/render triggered a full O(n log n)
   /// recursive re-sort on the main thread (the sidebar "slow as hell" jank).
   /// Stored + eager-on-mutation keeps reads O(1) and stays @Observable-tracked.
-  private(set) var sortedWorkspaceTree: [WorkspaceNode] = []
+  private(set) var sortedWorkspaceTree: [WorkspaceNode] = [] {
+    didSet { sortedWorkspaceTreeRevision &+= 1 }
+  }
+  private(set) var sortedWorkspaceTreeRevision: UInt64 = 0
 
   var hasWorkspaceContent: Bool {
     !workspaceRoots.isEmpty || !openFiles.isEmpty

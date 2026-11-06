@@ -395,7 +395,7 @@ final class AppController: ObservableObject {
     // one document and may rebuild workspace configuration, but it does not
     // reopen the previous working set.
     if intent == .newUntitledTab {
-      folderManager.restoreLastFolderInBackground(into: appState)
+      folderManager.restoreLastFolderInBackgroundIfNeeded(into: appState)
       // Idempotent: the window's construction already seeded this draft (see
       // `NewTabSessionSeed`), so this is the fallback for a controller that
       // never went through a factory window — and, just as importantly, the
@@ -422,7 +422,11 @@ final class AppController: ObservableObject {
     // gated on it at all. Persisted bookmarks are untouched on every path.
     let reopensWorkingSet = intent != .coldLaunch || launchSettings.restoreSessionOnLaunch
 
-    folderManager.restoreLastFolderInBackground(into: appState)
+    if isApplicationStartupRestore || intent == .coldLaunch {
+      folderManager.restoreLastFolderInBackground(into: appState)
+    } else {
+      folderManager.restoreLastFolderInBackgroundIfNeeded(into: appState)
+    }
     // The claim above is taken FIRST on purpose, and the reopen is gated on it
     // rather than on the intent: a cold launch that declines the working set is
     // still the application's one startup restore, so the launcher that appears
