@@ -37,17 +37,21 @@ struct TreeFingerprint: Codable, Equatable, Sendable {
     let documents = scans.flatMap(\.documents)
 
     // Fingerprint v1: sorted "relativePath|mtimeSeconds|size" markdown-file tuples from WorkspaceScanner.
-    let entries = try documents.map { document in
+    let entries = try documents.map { document -> FingerprintEntry in
       try Task.checkCancellation()
-      let relativePath =
-        document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
-      let values = try document.url.resourceValues(forKeys: [
-        .contentModificationDateKey,
-        .fileSizeKey,
-      ])
-      let mtime = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
-      let size = values.fileSize ?? 0
-      return FingerprintEntry(relativePath: relativePath, mtime: mtime, size: size)
+      return try autoreleasepool {
+        let relativePath =
+          document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
+        var url = document.url
+        defer { url.removeAllCachedResourceValues() }
+        let values = try url.resourceValues(forKeys: [
+          .contentModificationDateKey,
+          .fileSizeKey,
+        ])
+        let mtime = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+        let size = values.fileSize ?? 0
+        return FingerprintEntry(relativePath: relativePath, mtime: mtime, size: size)
+      }
     }
     .sorted { $0.relativePath < $1.relativePath }
 
@@ -76,20 +80,24 @@ struct TreeFingerprint: Codable, Equatable, Sendable {
 
     let sortedRoots = canonicalRootOrder(roots)
     let documents = scans.flatMap(\.documents)
-    let entries = try documents.map { document in
+    let entries = try documents.map { document -> FingerprintEntry in
       try Task.checkCancellation()
-      let rootIndex = try rootIndex(for: document, in: sortedRoots)
-      let root = sortedRoots[rootIndex]
-      let relativePath =
-        document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
-      let values = try document.url.resourceValues(forKeys: [
-        .contentModificationDateKey,
-        .fileSizeKey,
-      ])
-      let mtime = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
-      let size = values.fileSize ?? 0
-      return FingerprintEntry(
-        relativePath: "\(rootIndex):\(relativePath)", mtime: mtime, size: size)
+      return try autoreleasepool {
+        let rootIndex = try rootIndex(for: document, in: sortedRoots)
+        let root = sortedRoots[rootIndex]
+        let relativePath =
+          document.relativePath ?? WorkspaceScanner.relativePath(for: document.url, root: root)
+        var url = document.url
+        defer { url.removeAllCachedResourceValues() }
+        let values = try url.resourceValues(forKeys: [
+          .contentModificationDateKey,
+          .fileSizeKey,
+        ])
+        let mtime = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+        let size = values.fileSize ?? 0
+        return FingerprintEntry(
+          relativePath: "\(rootIndex):\(relativePath)", mtime: mtime, size: size)
+      }
     }
     .sorted { $0.relativePath < $1.relativePath }
 

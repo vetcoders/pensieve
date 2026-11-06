@@ -220,6 +220,56 @@ final class WorkspaceExclusionTests: XCTestCase {
     )
   }
 
+  @MainActor
+  func testNestedChildRootIsNotDoubleScannedOrDoubleIndexedUnderParentRoot() async throws {
+    let sandbox = try makeSandbox()
+    let parentRoot = sandbox.root.appendingPathComponent("vibecrafted", isDirectory: true)
+    let childRoot = parentRoot.appendingPathComponent("artifacts", isDirectory: true)
+    try FileManager.default.createDirectory(at: childRoot, withIntermediateDirectories: true)
+    let parentNote = parentRoot.appendingPathComponent("charter.md")
+    let childNote = childRoot.appendingPathComponent("report.md")
+    try "parent-charter-token".write(to: parentNote, atomically: true, encoding: .utf8)
+    try "child-artifact-token".write(to: childNote, atomically: true, encoding: .utf8)
+
+    let harness = try makeHarness(in: sandbox.support)
+    let appState = AppState()
+
+    // First open parentRoot alone so `artifacts/report.md` is initially indexed under parentRoot.
+    harness.manager.open(url: parentRoot, into: appState)
+    await settle(harness)
+    XCTAssertEqual(appState.documents.count, 2)
+
+    // Now add childRoot (`artifacts`) as its own workspace root alongside `parentRoot`.
+    harness.manager.open(url: childRoot, into: appState)
+    await settle(harness)
+
+    XCTAssertEqual(
+      appState.workspaceRoots.map { $0.url.standardizedFileURL },
+      [parentRoot.standardizedFileURL, childRoot.standardizedFileURL]
+    )
+    XCTAssertEqual(
+      appState.documents.count,
+      2,
+      "nested child root must not duplicate DocumentRefs in appState.documents"
+    )
+    let childDocRef = try XCTUnwrap(
+      appState.documents.first { $0.url.standardizedFileURL == childNote.standardizedFileURL }
+    )
+    XCTAssertEqual(
+      childDocRef.rootURL?.standardizedFileURL,
+      childRoot.standardizedFileURL,
+      "document inside nested child root must be owned by the child root"
+    )
+    XCTAssertEqual(
+      harness.indexDatabase.indexedDocumentCount(
+        forRootPaths: [parentRoot.standardizedFileURL.path],
+        appState: appState
+      ),
+      2,
+      "SQLite documents table must hold exactly 1 row for charter.md and 1 row for report.md (no duplicate parent row)"
+    )
+  }
+
   private struct Sandbox {
     let root: URL
     let support: URL

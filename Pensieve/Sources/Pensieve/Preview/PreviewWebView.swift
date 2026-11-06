@@ -262,6 +262,11 @@ final class PreviewWebView: NSView {
   }
 
   private func detachWebViewIfNeeded() {
+    if updateInFlight {
+      loadGeneration &+= 1
+      updateInFlight = false
+      hasDeferredLoadWhileUnselected = lastDocument != nil
+    }
     guard let webView, webView.superview === self else { return }
     NSLayoutConstraint.deactivate(webViewConstraints)
     webViewConstraints.removeAll()
@@ -469,7 +474,9 @@ final class PreviewWebView: NSView {
   // contract. Do not add a preview scroll observer without going through the
   // coordinator's latch semantics.
   private func scrollToScrollSyncPosition(_ position: ScrollSyncPosition) {
-    guard !isInvalidated, !isRecoveryPaused, loadedIdentity != nil else { return }
+    guard !isInvalidated, !isRecoveryPaused, !isUnselectedTabWindow, loadedIdentity != nil else {
+      return
+    }
     let progress = position.progress
     let script = """
       (function() {
@@ -603,6 +610,10 @@ final class PreviewWebView: NSView {
     if error != nil || (result as? Bool) != true {
       recoverPreview()
     } else if current != document {
+      if isUnselectedTabWindow {
+        hasDeferredLoadWhileUnselected = true
+        return
+      }
       // While WebKit was busy, load(document:) kept only the newest successor.
       updateLoadedPage(current)
     }
@@ -1819,6 +1830,12 @@ extension PreviewWebView: WKNavigationDelegate {
     activeNavigation = nil
     let loadedDocument = navigationDocument
     navigationDocument = nil
+    if isUnselectedTabWindow {
+      if let document = lastDocument, document != loadedDocument {
+        hasDeferredLoadWhileUnselected = true
+      }
+      return
+    }
     titlebarGlassController.navigationDidFinish()
     if let document = lastDocument, document != loadedDocument, !updateInFlight {
       updateLoadedPage(document)

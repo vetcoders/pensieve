@@ -2200,14 +2200,20 @@ final class FolderManager {
     entries.reserveCapacity(documents.count)
     for document in documents {
       guard !Task.isCancelled else { return nil }
-      guard
-        let values = try? document.url.resourceValues(forKeys: [
-          .contentModificationDateKey, .fileSizeKey,
-        ])
-      else { return nil }
-      let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
-      let size = values.fileSize ?? 0
-      entries[document.url.standardizedFileURL.path] = FileSignature(mtime: mtime, size: size)
+      let fileSignature: (path: String, sig: FileSignature)? = autoreleasepool {
+        var url = document.url.standardizedFileURL
+        defer { url.removeAllCachedResourceValues() }
+        guard
+          let values = try? url.resourceValues(forKeys: [
+            .contentModificationDateKey, .fileSizeKey,
+          ])
+        else { return nil }
+        let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let size = values.fileSize ?? 0
+        return (url.path, FileSignature(mtime: mtime, size: size))
+      }
+      guard let fileSignature else { return nil }
+      entries[fileSignature.path] = fileSignature.sig
     }
     return WorkspaceSignature(entries: entries)
   }
@@ -2927,11 +2933,31 @@ enum WorkspaceScanner {
   ) throws -> [WorkspaceScan] {
     var scans: [WorkspaceScan] = []
     scans.reserveCapacity(rootURLs.count)
+    var uniqueRootURLs: [URL] = []
+    uniqueRootURLs.reserveCapacity(rootURLs.count)
     var scannedRoots: Set<String> = []
     for rootURL in rootURLs {
-      try cancellationCheck()
       guard scannedRoots.insert(BookmarkStore.rootIdentityPath(rootURL)).inserted else { continue }
-      let rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
+      uniqueRootURLs.append(rootURL)
+    }
+    let standardizedRoots = uniqueRootURLs.map(\.standardizedFileURL)
+    for (index, rootURL) in uniqueRootURLs.enumerated() {
+      try cancellationCheck()
+      let stdRoot = standardizedRoots[index]
+      var rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
+      // When a workspace contains nested roots (e.g. ~/.vibecrafted and
+      // ~/.vibecrafted/artifacts), the child root owns its subtree and walks it
+      // once as its own root scan; exclude that subtree from the ancestor root's
+      // traversal so files are never walked, listed, or indexed twice.
+      for (otherIndex, otherStdRoot) in standardizedRoots.enumerated()
+      where otherIndex != index && otherStdRoot.path != stdRoot.path
+        && contains(otherStdRoot, in: stdRoot)
+      {
+        let nestedRelPath = relativePath(for: otherStdRoot, root: stdRoot)
+        if !nestedRelPath.isEmpty {
+          rootExclusions.insert(nestedRelPath)
+        }
+      }
       scans.append(
         try scan(
           folder: rootURL,
@@ -3156,8 +3182,9 @@ enum WorkspaceScanner {
   )
     -> WorkspaceDirectoryEntry?
   {
-    let standardizedURL = url.standardizedFileURL
+    var standardizedURL = url.standardizedFileURL
     guard contains(standardizedURL, in: root) else { return nil }
+    defer { standardizedURL.removeAllCachedResourceValues() }
 
     // Classify the link itself before asking Foundation whether its target is a directory/file.
     // Symlinked folders/files are excluded wholesale: no external targets, no self-cycle edges.
@@ -3184,8 +3211,9 @@ enum WorkspaceScanner {
       return nil
     }
 
+    let cleanURL = URL(fileURLWithPath: standardizedURL.path, isDirectory: isDirectory)
     return WorkspaceDirectoryEntry(
-      url: standardizedURL,
+      url: cleanURL,
       relativePath: relativePath,
       isDirectory: isDirectory,
       isRegularFile: isRegularFile
