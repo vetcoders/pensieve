@@ -35,6 +35,15 @@ final class PreviewWebView: NSView {
   /// Last skin `applyThemeChrome` was asked for, so a re-parent can re-assert the
   /// chrome without waiting for a document the render dedupe may never send.
   private var assertedSkin: PensieveTheme?
+  private weak var observedTabHostWindow: NSWindow?
+
+  private static let tabVisibilityNotifications: [Notification.Name] = [
+    NSWindow.didBecomeKeyNotification,
+    NSWindow.didResignKeyNotification,
+    NSWindow.didBecomeMainNotification,
+    NSWindow.didResignMainNotification,
+    NSWindow.didChangeOcclusionStateNotification,
+  ]
 
   // Test seam: observes full-page (re)loads without a live WKWebView process.
   var fullPageLoadObserver: ((PreviewDocument) -> Void)?
@@ -100,12 +109,15 @@ final class PreviewWebView: NSView {
   }
 
   isolated deinit {
+    stopObservingTabVisibility()
     titlebarGlassController.invalidate()
   }
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     guard !isInvalidated else { return }
+    observeTabVisibilityIfNeeded(window)
+    syncWebViewVisibility()
     titlebarGlassController.attach(to: window)
     // A re-parent hands us a window that knows nothing about the skin, and no
     // new document has to follow (the render dedupe may hold everything back
@@ -118,6 +130,8 @@ final class PreviewWebView: NSView {
   override func layout() {
     super.layout()
     guard !isInvalidated else { return }
+    syncWebViewVisibility()
+    guard !isUnselectedTabWindow else { return }
     titlebarGlassController.layoutDidChange()
   }
 
@@ -199,8 +213,73 @@ final class PreviewWebView: NSView {
     // this view's appearance alone leaves the titlebar and sidebar on the
     // previous skin. One shared definition of "wanted chrome"; equal values are
     // skipped inside.
-    if let window = self.window {
+    syncWebViewVisibility()
+    if let window = self.window, !isUnselectedTabWindow {
       WindowChromeRecipe.assertWindowChrome(on: window, for: skin)
+    }
+  }
+
+  /// True when this preview is attached to a window inside a multi-window
+  /// `NSWindowTabGroup` and that window is NOT the currently selected tab.
+  /// Hiding the `WKWebView` while unselected detaches WebKit's
+  /// `RemoteLayerTreeDisplayLinkClient`, avoids `DrawingArea_UpdateGeometry` /
+  /// `unfreezeAllLayerTrees` wakeups on background tabs, and allows
+  /// `WebPage::markLayersVolatile` to succeed without contending with
+  /// `WindowServer` render fences.
+  var isUnselectedTabWindow: Bool {
+    guard let window = self.window,
+      let tabGroup = window.tabGroup,
+      tabGroup.windows.count > 1,
+      let selectedWindow = tabGroup.selectedWindow
+    else {
+      return false
+    }
+    return selectedWindow !== window
+  }
+
+  func syncWebViewVisibility() {
+    guard let webView else { return }
+    let shouldHide = isRecoveryPaused || isUnselectedTabWindow
+    if webView.isHidden != shouldHide {
+      webView.isHidden = shouldHide
+    }
+  }
+
+  private func observeTabVisibilityIfNeeded(_ nextWindow: NSWindow?) {
+    guard observedTabHostWindow !== nextWindow else { return }
+    stopObservingTabVisibility()
+    observedTabHostWindow = nextWindow
+    guard nextWindow != nil else { return }
+    for name in Self.tabVisibilityNotifications {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(windowTabVisibilityDidChange(_:)),
+        name: name,
+        object: nil
+      )
+    }
+  }
+
+  private func stopObservingTabVisibility() {
+    guard observedTabHostWindow != nil else { return }
+    for name in Self.tabVisibilityNotifications {
+      NotificationCenter.default.removeObserver(self, name: name, object: nil)
+    }
+    observedTabHostWindow = nil
+  }
+
+  @objc private func windowTabVisibilityDidChange(_ notification: Notification) {
+    guard !isInvalidated, let hostWindow = self.window else { return }
+    if let notifyingWindow = notification.object as? NSWindow,
+      notifyingWindow !== hostWindow,
+      notifyingWindow.tabGroup !== hostWindow.tabGroup
+    {
+      return
+    }
+    let wasHidden = webView?.isHidden ?? false
+    syncWebViewVisibility()
+    if wasHidden, webView?.isHidden == false, let assertedSkin {
+      applyThemeChrome(for: assertedSkin)
     }
   }
 
@@ -237,7 +316,7 @@ final class PreviewWebView: NSView {
     automaticRecoveryCount = 0
     isRecoveryPaused = false
     recoveryNotice.isHidden = true
-    webView?.isHidden = false
+    syncWebViewVisibility()
   }
 
   @objc func resumePreview() {
@@ -251,6 +330,7 @@ final class PreviewWebView: NSView {
   func invalidate() {
     guard !isInvalidated else { return }
     isInvalidated = true
+    stopObservingTabVisibility()
     loadGeneration &+= 1
     updateInFlight = false
     activeNavigation = nil
