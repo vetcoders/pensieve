@@ -629,6 +629,18 @@ final class FolderManager {
       rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
   }
 
+  /// Rebuilds the persisted workspace for a mid-session launcher or new tab ONLY
+  /// when `appState` does not already hold (or build) a workspace tree. All tabs
+  /// in a running process share one `WorkspaceStore`, so an unconditional restore
+  /// on every `⌘T` / Dock reopen would cancel an in-flight build or re-walk a
+  /// workspace tree that is already live and watched.
+  func restoreLastFolderInBackgroundIfNeeded(into appState: AppState) {
+    if workspaceBuildTask != nil || !appState.workspaceTree.isEmpty {
+      return
+    }
+    restoreLastFolderInBackground(into: appState)
+  }
+
   func waitForPendingWorkspaceBuild() async {
     await workspaceBuildTask?.value
   }
@@ -2706,6 +2718,7 @@ private enum WorkspaceDefaults {
     "dist",
     "DerivedData",
     "target",
+    "worktrees",
   ]
 }
 
