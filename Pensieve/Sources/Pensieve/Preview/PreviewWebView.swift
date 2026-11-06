@@ -36,6 +36,17 @@ final class PreviewWebView: NSView {
   /// chrome without waiting for a document the render dedupe may never send.
   private var assertedSkin: PensieveTheme?
   private weak var observedTabHostWindow: NSWindow?
+  private weak var observedTabGroup: NSWindowTabGroup?
+  private var windowTabGroupObservation: NSKeyValueObservation?
+  private var tabGroupSelectedWindowObservation: NSKeyValueObservation?
+  private var tabGroupWindowsObservation: NSKeyValueObservation?
+  private var webViewConstraints: [NSLayoutConstraint] = []
+  private var hasDeferredLoadWhileUnselected = false
+  private var isWebViewDetachedForBackgroundTab = false
+  /// Test seam: overrides `isUnselectedTabWindow` so unit tests can exercise
+  /// unselected-tab detaching and deferred loading without calling native
+  /// `NSWindow.addTabbedWindow` (which touches WindowServer).
+  var unselectedTabWindowOverride: Bool?
 
   private static let tabVisibilityNotifications: [Notification.Name] = [
     NSWindow.didBecomeKeyNotification,
@@ -65,14 +76,7 @@ final class PreviewWebView: NSView {
       webView.setValue(false, forKey: "drawsBackground")
       webView.underPageBackgroundColor = WindowChromeRecipe.titlebarGlassBackingColor(for: .default)
       webView.setAccessibilityIdentifier("pensieve.preview")
-      addSubview(webView)
       webView.translatesAutoresizingMaskIntoConstraints = false
-      NSLayoutConstraint.activate([
-        webView.leadingAnchor.constraint(equalTo: leadingAnchor),
-        webView.trailingAnchor.constraint(equalTo: trailingAnchor),
-        webView.topAnchor.constraint(equalTo: topAnchor),
-        webView.bottomAnchor.constraint(equalTo: bottomAnchor),
-      ])
       webView.navigationDelegate = self
     }
 
@@ -95,11 +99,12 @@ final class PreviewWebView: NSView {
       recoveryNotice.widthAnchor.constraint(lessThanOrEqualToConstant: 320),
       recoveryNotice.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.9),
     ])
+    attachWebViewIfNeeded()
     // The controller's own `scriptEvaluator` is the single injectable seam for
     // glass-script choreography (see PreviewThemeTests); here it always targets
     // the live WKWebView.
     titlebarGlassController.scriptEvaluator = { [weak self] script in
-      guard let self, !isInvalidated, !isRecoveryPaused else { return }
+      guard let self, !isInvalidated, !isRecoveryPaused, !isUnselectedTabWindow else { return }
       webView?.evaluateJavaScript(script, completionHandler: nil)
     }
   }
@@ -159,6 +164,14 @@ final class PreviewWebView: NSView {
     lastDocument = document
     applyThemeChrome(for: document.skin)
     let identity = PreviewLoadIdentity(document: document)
+    if isUnselectedTabWindow {
+      if loadedIdentity != identity {
+        resetRecovery()
+      }
+      hasDeferredLoadWhileUnselected = true
+      return
+    }
+    hasDeferredLoadWhileUnselected = false
     guard loadedIdentity == identity else {
       resetRecovery()
       loadFullPage(document, identity: identity)
@@ -221,35 +234,96 @@ final class PreviewWebView: NSView {
 
   /// True when this preview is attached to a window inside a multi-window
   /// `NSWindowTabGroup` and that window is NOT the currently selected tab.
-  /// Hiding the `WKWebView` while unselected detaches WebKit's
-  /// `RemoteLayerTreeDisplayLinkClient`, avoids `DrawingArea_UpdateGeometry` /
-  /// `unfreezeAllLayerTrees` wakeups on background tabs, and allows
-  /// `WebPage::markLayersVolatile` to succeed without contending with
-  /// `WindowServer` render fences.
+  /// Detaching and hiding the `WKWebView` while unselected tears down WebKit's
+  /// `RemoteLayerTreeDisplayLinkClient`, prevents Auto Layout `setFrame:` from
+  /// sending `DrawingArea_UpdateGeometry` / `unfreezeAllLayerTrees` wakeups on
+  /// background tabs, and allows `WebPage::markLayersVolatile` to succeed
+  /// without contending with `WindowServer` render fences.
   var isUnselectedTabWindow: Bool {
-    guard let window = self.window,
-      let tabGroup = window.tabGroup,
-      tabGroup.windows.count > 1,
-      let selectedWindow = tabGroup.selectedWindow
-    else {
-      return false
+    if let unselectedTabWindowOverride { return unselectedTabWindowOverride }
+    return WindowChromeRecipe.isUnselectedTabWindow(window)
+  }
+
+  private func attachWebViewIfNeeded() {
+    guard let webView, webView.superview !== self else { return }
+    if recoveryNotice.superview === self {
+      addSubview(webView, positioned: .below, relativeTo: recoveryNotice)
+    } else {
+      addSubview(webView)
     }
-    return selectedWindow !== window
+    let constraints = [
+      webView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      webView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      webView.topAnchor.constraint(equalTo: topAnchor),
+      webView.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ]
+    NSLayoutConstraint.activate(constraints)
+    webViewConstraints = constraints
+  }
+
+  private func detachWebViewIfNeeded() {
+    guard let webView, webView.superview === self else { return }
+    NSLayoutConstraint.deactivate(webViewConstraints)
+    webViewConstraints.removeAll()
+    if activeNavigation != nil {
+      webView.stopLoading()
+      activeNavigation = nil
+      navigationDocument = nil
+      loadedIdentity = nil
+      hasDeferredLoadWhileUnselected = lastDocument != nil
+    }
+    webView.removeFromSuperview()
   }
 
   func syncWebViewVisibility() {
-    guard let webView else { return }
-    let shouldHide = isRecoveryPaused || isUnselectedTabWindow
-    if webView.isHidden != shouldHide {
+    if isUnselectedTabWindow {
+      isWebViewDetachedForBackgroundTab = true
+      detachWebViewIfNeeded()
+      if let webView, !webView.isHidden {
+        webView.isHidden = true
+      }
+      return
+    }
+    let wasDetachedForBackgroundTab = isWebViewDetachedForBackgroundTab
+    isWebViewDetachedForBackgroundTab = false
+    let wasDetached =
+      wasDetachedForBackgroundTab || (webView.map { $0.superview !== self } ?? false)
+    attachWebViewIfNeeded()
+    let shouldHide = isRecoveryPaused
+    let wasHidden = webView?.isHidden ?? wasDetachedForBackgroundTab
+    if let webView, webView.isHidden != shouldHide {
       webView.isHidden = shouldHide
+    }
+    if (wasDetached || wasHidden || hasDeferredLoadWhileUnselected) && !shouldHide {
+      if let assertedSkin, let window = self.window {
+        WindowChromeRecipe.assertWindowChrome(on: window, for: assertedSkin)
+      }
+      if hasDeferredLoadWhileUnselected || (wasDetached && loadedIdentity == nil),
+        let document = lastDocument
+      {
+        hasDeferredLoadWhileUnselected = false
+        load(document: document)
+      }
+      titlebarGlassController.layoutDidChange()
     }
   }
 
   private func observeTabVisibilityIfNeeded(_ nextWindow: NSWindow?) {
-    guard observedTabHostWindow !== nextWindow else { return }
+    guard observedTabHostWindow !== nextWindow else {
+      observeTabGroupIfNeeded(nextWindow?.tabGroup)
+      return
+    }
     stopObservingTabVisibility()
     observedTabHostWindow = nextWindow
-    guard nextWindow != nil else { return }
+    guard let nextWindow else { return }
+    windowTabGroupObservation = nextWindow.observe(\.tabGroup) { @Sendable [weak self] _, _ in
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.windowTabGroupDidChange() }
+      } else {
+        Task { @MainActor [weak self] in self?.windowTabGroupDidChange() }
+      }
+    }
+    observeTabGroupIfNeeded(nextWindow.tabGroup)
     for name in Self.tabVisibilityNotifications {
       NotificationCenter.default.addObserver(
         self,
@@ -260,12 +334,56 @@ final class PreviewWebView: NSView {
     }
   }
 
+  private func observeTabGroupIfNeeded(_ nextTabGroup: NSWindowTabGroup?) {
+    guard observedTabGroup !== nextTabGroup else { return }
+    tabGroupSelectedWindowObservation?.invalidate()
+    tabGroupSelectedWindowObservation = nil
+    tabGroupWindowsObservation?.invalidate()
+    tabGroupWindowsObservation = nil
+    observedTabGroup = nextTabGroup
+    guard let nextTabGroup else { return }
+    tabGroupSelectedWindowObservation = nextTabGroup.observe(\.selectedWindow) {
+      @Sendable [weak self] _, _ in
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.tabGroupSelectionDidChange() }
+      } else {
+        Task { @MainActor [weak self] in self?.tabGroupSelectionDidChange() }
+      }
+    }
+    tabGroupWindowsObservation = nextTabGroup.observe(\.windows) {
+      @Sendable [weak self] _, _ in
+      if Thread.isMainThread {
+        MainActor.assumeIsolated { self?.tabGroupSelectionDidChange() }
+      } else {
+        Task { @MainActor [weak self] in self?.tabGroupSelectionDidChange() }
+      }
+    }
+  }
+
   private func stopObservingTabVisibility() {
+    windowTabGroupObservation?.invalidate()
+    windowTabGroupObservation = nil
+    tabGroupSelectedWindowObservation?.invalidate()
+    tabGroupSelectedWindowObservation = nil
+    tabGroupWindowsObservation?.invalidate()
+    tabGroupWindowsObservation = nil
+    observedTabGroup = nil
     guard observedTabHostWindow != nil else { return }
     for name in Self.tabVisibilityNotifications {
       NotificationCenter.default.removeObserver(self, name: name, object: nil)
     }
     observedTabHostWindow = nil
+  }
+
+  private func windowTabGroupDidChange() {
+    guard !isInvalidated else { return }
+    observeTabGroupIfNeeded(observedTabHostWindow?.tabGroup)
+    tabGroupSelectionDidChange()
+  }
+
+  private func tabGroupSelectionDidChange() {
+    guard !isInvalidated else { return }
+    syncWebViewVisibility()
   }
 
   @objc private func windowTabVisibilityDidChange(_ notification: Notification) {
@@ -276,11 +394,8 @@ final class PreviewWebView: NSView {
     {
       return
     }
-    let wasHidden = webView?.isHidden ?? false
+    observeTabGroupIfNeeded(hostWindow.tabGroup)
     syncWebViewVisibility()
-    if wasHidden, webView?.isHidden == false, let assertedSkin {
-      applyThemeChrome(for: assertedSkin)
-    }
   }
 
   /// WKWebView leaves a blank page behind when its WebContent process dies
@@ -295,6 +410,11 @@ final class PreviewWebView: NSView {
   /// navigations/typing do not reset it: a toxic page may die just after loading.
   private func recoverPreview() {
     guard !isInvalidated, !isRecoveryPaused, let document = lastDocument else { return }
+    if isUnselectedTabWindow {
+      loadedIdentity = nil
+      hasDeferredLoadWhileUnselected = true
+      return
+    }
     guard automaticRecoveryCount < 2 else {
       DebugTrace.log("preview recovery paused after repeated failures")
       isRecoveryPaused = true

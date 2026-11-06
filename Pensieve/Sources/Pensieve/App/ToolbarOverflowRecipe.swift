@@ -300,6 +300,7 @@ final class ToolbarOverflowController: NSObject, NSMenuItemValidation {
   }
 
   private func handleWindowDidUpdate() {
+    guard !WindowChromeRecipe.isUnselectedTabWindow(window) else { return }
     guard needsFormRepair() else {
       if let window {
         _ = ToolbarOverflowRecipe.assertModeSegmentTooltips(

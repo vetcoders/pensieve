@@ -271,4 +271,56 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
       fullLoads.last, secondEdit,
       "fallback must reload the newest content, not the failed snapshot")
   }
+
+  @MainActor
+  func testUnselectedTabDefersLoadsAndBackgroundTerminationUntilSelected() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var fullLoads: [PreviewDocument] = []
+    view.fullPageLoadObserver = { fullLoads.append($0) }
+
+    view.unselectedTabWindowOverride = true
+    view.syncWebViewVisibility()
+
+    let initial = makeDocument(body: "<p>tab-1</p>")
+    let updated = makeDocument(body: "<p>tab-2</p>")
+    view.load(document: initial)
+    view.load(document: updated)
+    XCTAssertTrue(
+      fullLoads.isEmpty,
+      "unselected background tabs must defer WebKit HTML loads until selected")
+
+    // Process terminations while unselected must not reload in the background
+    // or consume the automatic recovery budget.
+    for _ in 0..<5 {
+      view.handleWebContentProcessTermination()
+    }
+    XCTAssertFalse(view.isRecoveryPaused)
+    XCTAssertTrue(fullLoads.isEmpty)
+
+    // Selecting the tab flushes the newest deferred document exactly once.
+    view.unselectedTabWindowOverride = false
+    view.syncWebViewVisibility()
+    XCTAssertEqual(fullLoads, [updated])
+  }
+
+  @MainActor
+  func testUnselectedTabDetachesAndReattachesLiveWebView() {
+    let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+    let webView = view.subviews.compactMap { $0 as? WKWebView }.first
+    XCTAssertNotNil(webView)
+    XCTAssertTrue(webView?.superview === view)
+
+    view.unselectedTabWindowOverride = true
+    view.syncWebViewVisibility()
+    XCTAssertNil(
+      webView?.superview,
+      "unselected tab must detach WKWebView from superview so Auto Layout setFrame and display links stop"
+    )
+    XCTAssertEqual(webView?.isHidden, true)
+
+    view.unselectedTabWindowOverride = false
+    view.syncWebViewVisibility()
+    XCTAssertTrue(webView?.superview === view)
+    XCTAssertEqual(webView?.isHidden, false)
+  }
 }
