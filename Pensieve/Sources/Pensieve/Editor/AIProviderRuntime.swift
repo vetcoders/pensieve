@@ -99,12 +99,8 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
   ]
   static let fallbackChainTriggerEnvironmentKeys =
     [
-      "PENSIEVE_ENABLE_FALLBACK_CHAIN",
-      KeychainOAuthAccountTokenStore.bundleAccount,
-      "CODESCRIBE_KEYCHAIN_BUNDLE_V1",
+      "PENSIEVE_ENABLE_FALLBACK_CHAIN"
     ]
-    + OAuthAccountRuntime.activeProviderEnvironmentKeys
-    + OAuthAccountProvider.allCases.map(\.tokenEnvironmentKey)
     + libraxisLocalEndpointEnvironmentKeys
     + libraxisCloudEndpointEnvironmentKeys
     + libraxisAPIKeyEnvironmentKeys
@@ -124,7 +120,7 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
     oauthTokenStore: (any OAuthAccountTokenStoring)? = nil,
     rewritePromptStore: RewritePromptStore = RewritePromptStore(),
-    includeDefaultFallbackChain: Bool = !AppSupportLocation.isRunningTests(),
+    includeDefaultFallbackChain: Bool = false,
     laneChoiceSuiteName: String? = nil,
     sendRequest: RequestSender? = nil
   ) {
@@ -657,7 +653,6 @@ final class AIProviderRuntime: AutocompleteCompleting, SessionAutocompleteComple
     let enableFallbacks =
       includeDefaultFallbackChain
       || Self.hasFallbackChainEnvironment(in: environment)
-      || !oauthCandidates.isEmpty
 
     var fallbackCandidates: [Configuration] = []
     if enableFallbacks {

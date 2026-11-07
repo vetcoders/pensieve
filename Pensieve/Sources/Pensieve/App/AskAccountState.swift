@@ -58,9 +58,12 @@ final class AskAccountState {
         if apiKeySelected { return }
         if let pinned = GrokAccount.pinnedAccountProvider(defaults), pinned != providerID { return }
       }
+      let previousApiKeySelected = apiKeySelected
+      let previousPinnedAccount = GrokAccount.pinnedAccountProvider(defaults)
       let bridge = self.bridge
       let environment = self.environment
-      try await Self.offMain {
+      let previousLaneProvider = try await Self.offMain { () -> String in
+        let priorProvider = bridge.assistiveLane().providerId
         let key = "LLM_ASSISTIVE_PROVIDER"
         let previous = environment?.value(forKey: key)
         // The engine resolves process env BEFORE persisted settings. Preserve
@@ -81,6 +84,7 @@ final class AskAccountState {
           guard bridge.assistiveLane().providerId == providerID else {
             throw CsError.Config(msg: "The engine did not apply the selected Ask provider.")
           }
+          return priorProvider
         } catch {
           if let environment {
             if let previous {
@@ -102,8 +106,14 @@ final class AskAccountState {
       case .automatic:
         break
       }
+      let committedSelectionChanged =
+        previousLaneProvider != providerID
+        || previousApiKeySelected != apiKeySelected
+        || previousPinnedAccount != GrokAccount.pinnedAccountProvider(defaults)
       await readSnapshot()
-      NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: nil)
+      if committedSelectionChanged {
+        NotificationCenter.default.post(name: .completionProviderSettingsDidChange, object: nil)
+      }
     }
     pending = Task { _ = try? await task.value }
     try await task.value

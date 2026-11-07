@@ -187,6 +187,11 @@ struct DispatchPopover: View {
       controller.refreshWorkflowCapabilities(force: true)
       mcpStatus = mcpClient.refreshStatus()
     }
+    .onChange(of: controller.agentWorkflows) { _, workflows in
+      if !workflows.contains(workflow), let first = workflows.first {
+        workflow = first
+      }
+    }
     .onChange(of: workflow) {
       synthesizer = ""
       model = ""

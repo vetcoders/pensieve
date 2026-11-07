@@ -214,18 +214,44 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
         "method": "notifications/initialized",
       ])
 
-    var toolCallID = 2
+    var nextRequestID = 2
     let overrides = ["model", "worktree"].filter { arguments[$0] != nil }
     if !overrides.isEmpty {
       // CLI capabilities and the connected MCP server can be different
       // generations. An older server must never silently discard selections.
-      try connection.write(
-        ["jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": [:] as [String: String]])
-      let listing = try connection.readResponse(id: 2)
-      let result = listing["result"] as? [String: Any]
-      let tools = result?["tools"] as? [[String: Any]] ?? []
-      let tool = tools.first { $0["name"] as? String == name }
-      let schema = tool?["inputSchema"] as? [String: Any]
+      var matchedTool: [String: Any]?
+      var cursor: String?
+      var seenCursors = Set<String>()
+      while matchedTool == nil {
+        let listRequestID = nextRequestID
+        nextRequestID += 1
+        var params: [String: String] = [:]
+        if let cursor {
+          params["cursor"] = cursor
+        }
+        try connection.write(
+          ["jsonrpc": "2.0", "id": listRequestID, "method": "tools/list", "params": params])
+        let listing = try connection.readResponse(id: listRequestID)
+        if listing["error"] != nil {
+          return Self.toolPayload(from: listing)
+        }
+        let result = listing["result"] as? [String: Any]
+        let tools = result?["tools"] as? [[String: Any]] ?? []
+        if let found = tools.first(where: { $0["name"] as? String == name }) {
+          matchedTool = found
+          break
+        }
+        guard
+          let nextCursor = (result?["nextCursor"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !nextCursor.isEmpty,
+          seenCursors.insert(nextCursor).inserted
+        else {
+          break
+        }
+        cursor = nextCursor
+      }
+      let schema = matchedTool?["inputSchema"] as? [String: Any]
       let properties = schema?["properties"] as? [String: Any] ?? [:]
       func declares(_ raw: Any?, type: String) -> Bool {
         guard let field = raw as? [String: Any] else { return false }
@@ -245,8 +271,8 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
             + ". Update that server before dispatching these selections.",
         ]
       }
-      toolCallID = 3
     }
+    let toolCallID = nextRequestID
     try connection.write(
       [
         "jsonrpc": "2.0",

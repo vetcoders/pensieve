@@ -188,12 +188,13 @@ final class FolderManager {
   /// ownership of the activity display (it bumped the generation before cancelling this
   /// task), and when there is nothing to clear. This is the ONLY clear point for the
   /// background path, so every early `return` in the build task tears the spinner down.
-  private func finishOpenFlow(generation: UInt64, into appState: AppState) {
+  private func finishOpenFlow(generation: UInt64, into appState: AppState?) {
     guard generation == openFlowGeneration else { return }
+    workspaceBuildTask = nil
     // A completed value-returning task still owns its full scan result.
     // Only this generation may release the current cancellation handle.
     workspaceValidationTask = nil
-    guard appState.workspaceActivity != nil else { return }
+    guard let appState, appState.workspaceActivity != nil else { return }
     setOpenActivity(nil, into: appState)
   }
 
@@ -1443,6 +1444,7 @@ final class FolderManager {
   ///   Only `removeRoot`'s last-root path does this.
   func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     // Take ownership of the activity display so the cancelled build's terminal clear
@@ -1499,6 +1501,7 @@ final class FolderManager {
   ) {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     openFlowGeneration &+= 1
@@ -1707,6 +1710,7 @@ final class FolderManager {
   ) {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     openFlowGeneration &+= 1
@@ -1780,13 +1784,14 @@ final class FolderManager {
     workspaceValidationTask = validationTask
 
     workspaceBuildTask = Task { [weak self, weak appState] in
-      guard let self, let appState else { return }
+      guard let self else { return }
       // EVERY exit from this task — cancellation guard, workspace mismatch, or the
       // normal tail — must tear the `.opening`/`.indexing` presentation down, unless a
       // newer open flow already owns the display. A bare `return` here used to leave
       // the "Opening Workspace" spinner on screen forever (e.g. an ad-hoc file opened
       // mid-walk fails the workspace match; `applyRefresh` cancels the build outright).
       defer { self.finishOpenFlow(generation: generation, into: appState) }
+      guard let appState else { return }
       let validation: WorkspaceValidationResult
       do {
         validation = try await withTaskCancellationHandler {

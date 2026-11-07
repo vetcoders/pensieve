@@ -101,13 +101,13 @@ def transform_landing_page(
             "docs/index.html JSON-LD softwareVersion",
         ),
         (
-            r"(Version\s+<code>)\d+\.\d+\.\d+(</code>)",
+            r"(Version\s+<code[^>]*>)\d+\.\d+\.\d+(</code>)",
             rf"\g<1>{version}\g<2>",
             0,
             "docs/index.html hero release-note version",
         ),
         (
-            r'(<div class="section-label">Release\s+)\d+\.\d+\.\d+(</div>)',
+            r'(<div class="section-label"[^>]*>Release\s+)\d+\.\d+\.\d+(</div>)',
             rf"\g<1>{version}\g<2>",
             0,
             "docs/index.html What's new section label",
@@ -128,7 +128,7 @@ def transform_landing_page(
         placeholder = placeholder_for_version(version)
         updated = replace_once(
             updated,
-            r'(<div class="sha">\s*<b>SHA-256</b>\s*<br\s*/?>\s*)[^<\s]+(\s*</div>)',
+            r'(<div class="sha"[^>]*>\s*<b>SHA-256</b>\s*<br\s*/?>\s*)[^<\s]+(\s*</div>)',
             rf"\g<1>{placeholder}\g<2>",
             flags=re.DOTALL,
             label="docs/index.html SHA-256 slot",
@@ -143,20 +143,26 @@ def sync_versions(
 
     version_original = VERSION_FILE.read_text(encoding="utf-8")
     version_updated = f"{version}\n"
-    if version_original != version_updated:
+    version_changed = version_original != version_updated
+    if version_changed:
         changed.append(root_relative(VERSION_FILE))
-        if write:
-            VERSION_FILE.write_text(version_updated, encoding="utf-8")
 
+    page_updated: str | None = None
+    page_changed = False
     if LANDING_PAGE.is_file():
         page_original = LANDING_PAGE.read_text(encoding="utf-8")
         page_updated = transform_landing_page(
             page_original, version, reset_checksum=reset_checksum
         )
-        if page_original != page_updated:
+        page_changed = page_original != page_updated
+        if page_changed:
             changed.append(root_relative(LANDING_PAGE))
-            if write:
-                LANDING_PAGE.write_text(page_updated, encoding="utf-8")
+
+    if write:
+        if version_changed:
+            VERSION_FILE.write_text(version_updated, encoding="utf-8")
+        if page_changed and page_updated is not None:
+            LANDING_PAGE.write_text(page_updated, encoding="utf-8")
 
     return changed
 

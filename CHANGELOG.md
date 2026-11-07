@@ -5,8 +5,6 @@ All notable changes to Pensieve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.7.0] - 2026-10-04
 
 ### Added
@@ -40,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedded engine's document tools on its live buffer, including unsaved text
   and native Undo/Redo. Opening returns a receipt, not the entire document.
 - Read the end of a document directly and page through literal search results.
+- Inline autocomplete now resolves through the 3-tier provider fallback chain
+  (signed-in OAuth account for OpenAI Codex, xAI Grok, or Google Gemini Cloud
+  Code Assist → local/cloud Libraxis → OpenRouter / manual API key) and updates
+  Settings readiness and status without requiring a typed API key.
 
 ### Changed
 
@@ -56,6 +58,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The fixed 96/120 pt plain-text transcript and fixed-height Ask panels are
   replaced by the shared surface above; the status bar, sidebar and editor
   invariants are unchanged, and Hide remains distinct from Stop.
+
+### Fixed
+
+- Detach `WKWebView` from its superview while a document window is an unselected
+  tab in a multi-window `NSWindowTabGroup` (observing `window.tabGroup`,
+  `tabGroup.selectedWindow`, and `tabGroup.windows` via KVO), cancel in-flight
+  preview JS updates on deselection, and skip background
+  `NSWindow.didUpdateNotification` chrome repair walks so background tabs no
+  longer wake `WebContent` processes or stall `WindowServer` / `screencapture`.
+- Exclude strict descendant workspace roots from ancestor root scans in
+  `WorkspaceScanner.build`, deduplicate overlapping candidate documents by
+  deepest `rootURL` in `IndexDatabase.prepareWorkspaceWritePlan` and
+  `AskThread.makeHost`, and exclude `worktrees` directories by default so nested
+  workspace roots are never double-scanned or double-indexed.
+- Bound inline candidate bodies in `IndexDatabase.prepareWorkspaceWritePlan` to
+  `4 MiB` with per-record `autoreleasepool` streaming, clear `NSURL`
+  `_FileCache` resource caches during scanning/indexing, preserve sorted CoW
+  `[WorkspaceNode]` buffers in `WorkspaceStore.sortNodes`, replace `NOT IN`
+  parameter lists in `tombstoneDocumentsNotIn` to avoid SQLite's 32,766-variable
+  limit, and invoke `malloc_zone_pressure_relief` after index writes.
 
 ### Release engineering
 

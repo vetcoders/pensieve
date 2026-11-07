@@ -400,10 +400,19 @@ struct OAuthAccountTokens: Codable, Equatable, Sendable {
     return trimmed
   }
 
-  private static func int64Value(_ raw: Any?) -> Int64? {
+  static func int64Value(_ raw: Any?) -> Int64? {
     if let int64 = raw as? Int64 { return int64 }
     if let int = raw as? Int { return Int64(int) }
-    if let double = raw as? Double, double.isFinite { return Int64(double) }
+    if let double = raw as? Double {
+      guard
+        double.isFinite,
+        double >= Double(Int64.min),
+        double < 9_223_372_036_854_775_808.0
+      else {
+        return nil
+      }
+      return Int64(exactly: double.rounded(.towardZero))
+    }
     if let number = raw as? NSNumber { return number.int64Value }
     if let string = raw as? String,
       let parsed = Int64(string.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -433,6 +442,8 @@ final class KeychainOAuthAccountTokenStore: OAuthAccountTokenStoring {
 
   private struct CacheState: Sendable {
     var cachedTokens: [OAuthAccountProvider: OAuthAccountTokens] = [:]
+    var refreshedTokens: [OAuthAccountProvider: OAuthAccountTokens] = [:]
+    var missingProviders: Set<OAuthAccountProvider> = []
     var lastKeychainLoad: Date?
   }
 
@@ -470,6 +481,8 @@ final class KeychainOAuthAccountTokenStore: OAuthAccountTokenStoring {
   func invalidateCache() {
     state.withLock { state in
       state.cachedTokens.removeAll()
+      state.refreshedTokens.removeAll()
+      state.missingProviders.removeAll()
       state.lastKeychainLoad = nil
     }
   }
@@ -485,6 +498,15 @@ final class KeychainOAuthAccountTokenStore: OAuthAccountTokenStoring {
       return decoded
     }
 
+    if let refreshed = state.withLock({ state -> OAuthAccountTokens? in
+      guard let tokens = state.refreshedTokens[provider], tokens.hasUsableCredentials else {
+        return nil
+      }
+      return tokens
+    }) {
+      return refreshed
+    }
+
     if let rawBundleEnv = environment.value(forKey: Self.bundleAccount)
       ?? environment.value(forKey: "CODESCRIBE_KEYCHAIN_BUNDLE_V1")
     {
@@ -495,32 +517,44 @@ final class KeychainOAuthAccountTokenStore: OAuthAccountTokenStoring {
     }
 
     let now = Date()
-    if let cached = state.withLock({ state -> OAuthAccountTokens? in
-      if let tokens = state.cachedTokens[provider], tokens.hasUsableCredentials {
-        if !allowSystemKeychain {
-          return tokens
+    let cacheLookup = state.withLock { state -> (hit: Bool, tokens: OAuthAccountTokens?) in
+      if !allowSystemKeychain {
+        if let tokens = state.cachedTokens[provider], tokens.hasUsableCredentials {
+          return (true, tokens)
         }
-        if let lastLoad = state.lastKeychainLoad, now.timeIntervalSince(lastLoad) < cacheTTL {
-          return tokens
+        return (true, nil)
+      }
+      if let lastLoad = state.lastKeychainLoad, now.timeIntervalSince(lastLoad) < cacheTTL {
+        if let tokens = state.cachedTokens[provider], tokens.hasUsableCredentials {
+          return (true, tokens)
+        }
+        if state.missingProviders.contains(provider) {
+          return (true, nil)
         }
       }
-      return nil
-    }) {
-      return cached
+      return (false, nil)
     }
-
-    guard allowSystemKeychain else {
-      return state.withLock { $0.cachedTokens[provider] }
+    if cacheLookup.hit {
+      return cacheLookup.tokens
     }
 
     let loaded = loadFromSystemKeychain(environment: environment)
-    state.withLock { state in
-      for (key, value) in loaded {
-        state.cachedTokens[key] = value
+    return state.withLock { state in
+      for candidate in OAuthAccountProvider.allCases {
+        if let refreshed = state.refreshedTokens[candidate], refreshed.hasUsableCredentials {
+          state.cachedTokens[candidate] = refreshed
+          state.missingProviders.remove(candidate)
+        } else if let value = loaded[candidate], value.hasUsableCredentials {
+          state.cachedTokens[candidate] = value
+          state.missingProviders.remove(candidate)
+        } else {
+          state.cachedTokens.removeValue(forKey: candidate)
+          state.missingProviders.insert(candidate)
+        }
       }
       state.lastKeychainLoad = now
+      return state.cachedTokens[provider]
     }
-    return state.withLock { $0.cachedTokens[provider] }
   }
 
   func saveTokens(
@@ -530,13 +564,38 @@ final class KeychainOAuthAccountTokenStore: OAuthAccountTokenStoring {
   ) {
     state.withLock { state in
       state.cachedTokens[provider] = tokens
+      state.refreshedTokens[provider] = tokens
+      state.missingProviders.remove(provider)
       state.lastKeychainLoad = Date()
     }
     if let encoded = try? JSONEncoder().encode(tokens),
-      let jsonString = String(data: encoded, encoding: .utf8),
-      environment.value(forKey: provider.tokenEnvironmentKey) != nil
+      let jsonString = String(data: encoded, encoding: .utf8)
     {
-      try? environment.setValue(jsonString, forKey: provider.tokenEnvironmentKey)
+      if environment.value(forKey: provider.tokenEnvironmentKey) != nil {
+        try? environment.setValue(jsonString, forKey: provider.tokenEnvironmentKey)
+      }
+      if let tokenObject = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] {
+        for bundleKey in [Self.bundleAccount, "CODESCRIBE_KEYCHAIN_BUNDLE_V1"] {
+          guard
+            let rawBundle = environment.value(forKey: bundleKey),
+            let bundleData = rawBundle.data(using: .utf8),
+            var bundleObject = try? JSONSerialization.jsonObject(with: bundleData)
+              as? [String: Any]
+          else { continue }
+          var entries = (bundleObject["entries"] as? [String: Any]) ?? bundleObject
+          entries[provider.tokenEnvironmentKey] = tokenObject
+          if bundleObject["entries"] != nil {
+            bundleObject["entries"] = entries
+          } else {
+            bundleObject = entries
+          }
+          if let updatedData = try? JSONSerialization.data(withJSONObject: bundleObject),
+            let updatedString = String(data: updatedData, encoding: .utf8)
+          {
+            try? environment.setValue(updatedString, forKey: bundleKey)
+          }
+        }
+      }
     }
   }
 
@@ -1011,9 +1070,9 @@ enum OAuthAccountRuntime {
     {
       updated.tokenType = newType
     }
-    if let expiresIn = (json["expires_in"] as? NSNumber)?.int64Value, expiresIn > 0 {
-      updated.expiresAtUnix = Int64(Date().timeIntervalSince1970) + expiresIn
-    }
+    let rawExpiresIn = OAuthAccountTokens.int64Value(json["expires_in"])
+    let lifetimeSeconds = (rawExpiresIn ?? 0) > 0 ? rawExpiresIn! : 3600
+    updated.expiresAtUnix = Int64(Date().timeIntervalSince1970) + lifetimeSeconds
     return updated
   }
 

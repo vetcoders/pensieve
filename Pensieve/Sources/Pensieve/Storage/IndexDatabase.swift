@@ -2306,14 +2306,20 @@ final class IndexDatabase {
       for record in plan.records {
         // Skip the write (and the count) when the stored row already matches —
         // the unchanged-relaunch / double-write-collapse case.
-        let shouldWrite = try autoreleasepool { () -> Bool in
-          guard let body = record.resolvedBody() else { return false }
-          return try !existingDocumentMatches(record, withBody: body, in: db)
+        let resolvedRecord = try autoreleasepool { () -> DocumentWriteRecord? in
+          guard let body = record.resolvedBody() else { return nil }
+          guard try !existingDocumentMatches(record, withBody: body, in: db) else {
+            return nil
+          }
+          var resolved = record
+          resolved.inlineBody = body
+          resolved.bodyURL = nil
+          return resolved
         }
-        if !shouldWrite {
+        guard let resolvedRecord else {
           continue
         }
-        batch.append(record)
+        batch.append(resolvedRecord)
         if batch.count == batchSize {
           try abandonIfClosedForTermination(latch)
           try upsertDocuments(batch, in: db)
@@ -2601,12 +2607,19 @@ final class IndexDatabase {
       }
     }
     let resolvedDocs: [ResolvedDocMeta]
+    var shadowedWorkspaces = Set<String>()
     if bestIndexByFilePath.count == rawResolvedDocs.count {
       resolvedDocs = rawResolvedDocs
     } else {
       let chosenIndices = Set(bestIndexByFilePath.values)
       resolvedDocs = rawResolvedDocs.enumerated().compactMap { index, meta in
-        chosenIndices.contains(index) ? meta : nil
+        if chosenIndices.contains(index) {
+          return meta
+        }
+        if !meta.isAdHoc {
+          shadowedWorkspaces.insert(meta.workspaceID)
+        }
+        return nil
       }
     }
 
@@ -2694,12 +2707,11 @@ final class IndexDatabase {
     // for workspaces that either had at least one readable document OR had all their
     // documents shadowed by a nested child root (so tombstoneDocumentsNotIn cleans
     // any stale duplicate rows in the parent workspace).
-    if activeWorkspaces.isEmpty && bestIndexByFilePath.count == rawResolvedDocs.count {
+    if activeWorkspaces.isEmpty && shadowedWorkspaces.isEmpty {
       canonicalByWorkspace.removeAll()
     } else {
       canonicalByWorkspace = canonicalByWorkspace.filter { wsID, _ in
-        activeWorkspaces.contains(wsID)
-          || (wsID != Self.adHocWorkspaceID && bestIndexByFilePath.count < rawResolvedDocs.count)
+        activeWorkspaces.contains(wsID) || shadowedWorkspaces.contains(wsID)
       }
     }
 
@@ -2822,7 +2834,7 @@ final class IndexDatabase {
   private nonisolated static func upsertDocument(_ record: DocumentWriteRecord, in db: Database)
     throws
   {
-    guard let body = record.resolvedBody() else { return }
+    guard let body = record.inlineBody ?? record.resolvedBody() else { return }
     let now = Int(Date().timeIntervalSince1970)
     try db.execute(
       sql: """

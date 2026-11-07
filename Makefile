@@ -263,7 +263,7 @@ changelog-close:  ## Close CHANGELOG.md '[Unreleased]' to current VERSION + date
 
 .PHONY: release-notes
 release-notes:  ## Print release notes body derived from CHANGELOG.md current version section
-	@$(PYTHON) $(SCRIPTS)/release_sync.py notes $(if $(origin VERSION),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
+	@$(PYTHON) $(SCRIPTS)/release_sync.py notes $(if $(filter command line,$(origin VERSION)),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
 
 .PHONY: release-plan
 release-plan:  ## Print the full release and publish flow
@@ -371,7 +371,8 @@ notarize:  ## DMG-only: package + notarize + staple from existing signed .app (p
 	@$(SCRIPTS)/build-release.sh --dmg-only
 
 .PHONY: publish
-publish: ffi-check  ## Publish notarized DMG: stamp docs/index.html + GitHub Release (--latest) + internal shelf
+publish: gates  ## Publish notarized DMG: stamp docs/index.html + GitHub Release (--latest) + internal shelf
+publish: ffi-check
 	@$(SCRIPTS)/build-release.sh --publish
 
 .PHONY: release-appstore

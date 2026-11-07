@@ -236,6 +236,7 @@ final class ProviderSettings: ObservableObject {
   private let environment: ProviderEnvironmentManaging
   private let oauthTokenStore: any OAuthAccountTokenStoring
   private let defaultFallbackChainEnabled: Bool
+  private let allowSharedAccountFallback: Bool
   private let modelDiscovery: ProviderModelDiscovering
   private var managedEnvironmentKeys: Set<String> = []
   private var discoveryGeneration: UInt64 = 0
@@ -248,7 +249,8 @@ final class ProviderSettings: ObservableObject {
     keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
     environment: ProviderEnvironmentManaging = ProcessProviderEnvironment(),
     oauthTokenStore: (any OAuthAccountTokenStoring)? = nil,
-    defaultFallbackChainEnabled: Bool = !AppSupportLocation.isRunningTests(),
+    defaultFallbackChainEnabled: Bool = false,
+    allowSharedAccountFallback: Bool = !AppSupportLocation.isRunningTests(),
     modelDiscovery: ProviderModelDiscovering? = nil
   ) {
     self.defaults = defaults
@@ -256,6 +258,7 @@ final class ProviderSettings: ObservableObject {
     self.environment = environment
     self.oauthTokenStore = oauthTokenStore ?? KeychainOAuthAccountTokenStore()
     self.defaultFallbackChainEnabled = defaultFallbackChainEnabled
+    self.allowSharedAccountFallback = allowSharedAccountFallback
     self.modelDiscovery = modelDiscovery ?? ProviderModelDiscovery(defaults: defaults)
     let persistedShape =
       CompletionProviderShape(
@@ -284,7 +287,7 @@ final class ProviderSettings: ObservableObject {
     if OAuthAccountRuntime.hasSignedInAccount(in: environment, tokenStore: oauthTokenStore) {
       return true
     }
-    if defaultFallbackChainEnabled {
+    if allowSharedAccountFallback {
       return GrokAccount.shared.snapshot.isSignedIn || CodexAccount.shared.snapshot.isSignedIn
     }
     return false
@@ -299,7 +302,7 @@ final class ProviderSettings: ObservableObject {
         return provider.displayName
       }
     }
-    if defaultFallbackChainEnabled {
+    if allowSharedAccountFallback {
       if GrokAccount.shared.snapshot.askUsesGrok || GrokAccount.shared.snapshot.isSignedIn {
         return OAuthAccountProvider.xAIResponses.displayName
       }
@@ -312,7 +315,7 @@ final class ProviderSettings: ObservableObject {
 
   /// Autocomplete is configured when an explicit endpoint + model are set,
   /// when an OAuth account is signed in (Tier 1), or when the Libraxis/OpenRouter
-  /// 3-tier fallback chain (Tier 2/3) is available.
+  /// fallback chain (Tier 2/3) is explicitly opted in.
   var isConfigured: Bool {
     (Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
       && Self.hasNonEmptyValue(in: Self.modelEnvironmentKeys, environment: environment))
