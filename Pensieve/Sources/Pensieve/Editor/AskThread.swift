@@ -125,11 +125,24 @@ final class AskThread: Identifiable {
       }
       // Explicit selections are capabilities in their own right. They do not
       // grant access to sibling files or their parent directory.
-      var paths: Set<String> = []
       let pinnedFiles = context.files.filter { $0.url.resolvingSymlinksInPath() == $0.url }
-      let scoped = (pinnedFiles + rooted).filter {
-        $0.url.isFileURL && paths.insert($0.url.standardizedFileURL.path).inserted
+      let candidates = (pinnedFiles + rooted).filter(\.url.isFileURL)
+      var orderedPaths: [String] = []
+      var bestRefByPath: [String: DocumentRef] = [:]
+      for ref in candidates {
+        let path = ref.url.standardizedFileURL.path
+        if let existing = bestRefByPath[path] {
+          let existingRootDepth = existing.rootURL?.standardizedFileURL.path.count ?? 0
+          let candidateRootDepth = ref.rootURL?.standardizedFileURL.path.count ?? 0
+          if (!ref.isAdHoc && existing.isAdHoc) || candidateRootDepth > existingRootDepth {
+            bestRefByPath[path] = ref
+          }
+        } else {
+          orderedPaths.append(path)
+          bestRefByPath[path] = ref
+        }
       }
+      let scoped = orderedPaths.compactMap { bestRefByPath[$0] }
       let allowed = Dictionary(
         scoped.map { ref in
           autoreleasepool { (ref.url.standardizedFileURL.path, ref.url.resolvingSymlinksInPath()) }
@@ -150,7 +163,7 @@ final class AskThread: Identifiable {
         search: { query, limit in
           try Self.searchFromCallback(
             query: query, limit: limit,
-            documents: scoped.filter { ref in
+            documents: candidates.filter { ref in
               let path = ref.url.standardizedFileURL.path
               return ref.url.resolvingSymlinksInPath() == allowed[path]
             }, database: database)
