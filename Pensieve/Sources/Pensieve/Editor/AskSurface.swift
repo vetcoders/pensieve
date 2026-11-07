@@ -12,6 +12,7 @@ import SwiftUI
 /// title and surface buttons retain their width instead of wrapping or clipping.
 struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View {
   @Binding var presentation: AskPresentationState
+  var dockOwnerSize: CGSize? = nil
   @ViewBuilder var headerControls: (Bool) -> HeaderControls
   @ViewBuilder var transcript: () -> Transcript
   @ViewBuilder var composer: () -> Composer
@@ -23,7 +24,7 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
   var body: some View {
     GeometryReader { proxy in
       let content = proxy.size
-      let layout = AskSurfaceLayout.allocate(content: content, presentation: presentation)
+      let layout = AskSurfaceLayout.allocateHosted(content: content, presentation: presentation)
       let tokens = themeManager.skin.tokens
       let shellRole: AskChromeRole =
         presentation.mode == .floating ? .floatingShell : .dockShell
@@ -32,7 +33,8 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         reduceTransparency: reduceTransparency,
         role: shellRole)
       let palette = AskSurfacePalette.resolve(tokens: tokens, material: shellMaterial)
-      panel(layout: layout, content: content, palette: palette, material: shellMaterial)
+      let resizeBounds = presentation.mode == .docked ? (dockOwnerSize ?? content) : content
+      panel(layout: layout, content: resizeBounds, palette: palette, material: shellMaterial)
         .frame(width: max(layout.askRegion.width, 0), height: max(layout.askRegion.height, 0))
         .opacity(presentation.mode == .hidden ? 0 : 1)
         .allowsHitTesting(presentation.mode != .hidden && layout.askRegion.height > 1)
@@ -66,13 +68,22 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
         .accessibilityIdentifier("pensieve.askSurface.composer")
     }
     .foregroundStyle(Color(nsColor: palette.text))
+    .tint(Color(nsColor: themeManager.skin.tokens.legibleAccent))
     .background { shellBackground(material: material, shape: shape, palette: palette) }
     .clipShape(shape)
     .accessibilityElement(children: .contain)
     .accessibilityAdjustableAction { direction in
       let delta: CGFloat = direction == .increment ? 24 : -24
       update { state in
-        state.resizeDock(to: state.preferredDockHeight + delta, in: content)
+        if state.mode == .docked {
+          let bounds = dockOwnerSize ?? content
+          state.resizeDock(to: state.preferredDockHeight + delta, in: bounds)
+        } else if state.mode == .floating {
+          state.preferredFloatSize.width = max(
+            AskSurfaceLayout.minimumPanelWidth, state.preferredFloatSize.width + delta)
+          state.preferredFloatSize.height = max(
+            AskSurfaceLayout.minimumPanelHeight, state.preferredFloatSize.height + delta)
+        }
       }
     }
   }
@@ -177,9 +188,10 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func expandButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let expanded = presentation.isExpanded
+    let bounds = dockOwnerSize ?? content
     return Button {
       update { state in
-        _ = state.apply(expanded ? .collapse : .expand, content: content)
+        _ = state.apply(expanded ? .collapse : .expand, content: bounds)
       }
     } label: {
       Image(systemName: expanded ? AskSurfaceSymbol.collapse : AskSurfaceSymbol.expand)
@@ -194,9 +206,10 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
 
   private func presentationButton(content: CGSize, palette: AskSurfacePalette) -> some View {
     let floating = presentation.mode == .floating
+    let bounds = dockOwnerSize ?? content
     return Button {
       update { state in
-        _ = state.apply(floating ? .dock : .float, content: content)
+        _ = state.apply(floating ? .dock : .float, content: bounds)
       }
     } label: {
       Image(systemName: floating ? AskSurfaceSymbol.dock : AskSurfaceSymbol.float)
@@ -232,36 +245,26 @@ struct AskSurface<Transcript: View, Composer: View, HeaderControls: View>: View 
     switch material {
     case .solidTheme, .plain:
       shape.fill(Color(nsColor: palette.background))
-    case .systemMaterial:
-      shape.fill(.regularMaterial)
-    case .liquidGlass:
-      glassFill(shape: shape, fallback: Color(nsColor: palette.background))
-    }
-  }
+    case .systemMaterial, .liquidGlass:
+      TaflaSurfaceBackground(theme: themeManager.skin)
 
-  @ViewBuilder
-  private func glassFill(shape: RoundedRectangle, fallback: Color) -> some View {
-    if #available(macOS 26, *) {
-      Color.clear.glassEffect(.regular, in: shape)
-    } else {
-      shape.fill(.regularMaterial)
-        .overlay { shape.fill(fallback.opacity(0.01)) }
     }
   }
 
   private func dockGripDrag(content: CGSize) -> some Gesture {
     DragGesture(minimumDistance: 1)
       .onChanged { value in
+        let bounds = dockOwnerSize ?? content
         let start =
           dockDragStart
           ?? AskSurfaceLayout.displayedDockHeight(
-            presentation: presentation, content: content)
+            presentation: presentation, content: bounds)
         if dockDragStart == nil { dockDragStart = start }
         update { state in
           AskPointerRoute.apply(
             .dockResize,
             to: &state,
-            content: content,
+            content: bounds,
             dockStart: start,
             translation: value.translation)
         }

@@ -19,7 +19,9 @@ final class WindowErrorChromeRig {
   let appState: AppState
   let controller: AppController
   let themeManager: ThemeManager
-  let askThreads = DocumentAskThreadStore()
+  let askThreads: AskThreadStore
+  let askPanelController: AskPanelController
+  let commandSurface: CommandSurfaceContext
   let window: NSWindow
   let hosting: NSHostingView<AnyView>
 
@@ -31,7 +33,14 @@ final class WindowErrorChromeRig {
     }
   }
 
-  init(defaults: UserDefaults) {
+  init(
+    defaults: UserDefaults,
+    askSession: AskPanelController? = nil,
+    commandSurface: CommandSurfaceContext? = nil
+  ) {
+    self.commandSurface = commandSurface ?? CommandSurfaceContext()
+    askPanelController = askSession ?? AskPanelController(defaults: defaults)
+    askThreads = askPanelController.threads
     appState = AppState(defaults: defaults)
     // `.source` rather than `.split`: the preview half renders Markdown through
     // the whole pipeline on every layout pass, and this rig is about the error
@@ -47,14 +56,18 @@ final class WindowErrorChromeRig {
       defer: true)
     window.isReleasedWhenClosed = false
 
+    self.commandSurface.adopt(appState: appState, controller: controller)
     hosting = NSHostingView(
       rootView: AnyView(
         ContentView(
+          hostWindow: .constant(window),
           // Configured + autocomplete off, so the onboarding sheet this window
           // can present never becomes eligible and never covers the chrome.
           providerOnboardingCoordinator: ProviderOnboardingCoordinator(
             autocompleteEnabled: false, providerConfigured: true),
-          askThreads: askThreads
+          askThreads: askThreads,
+          askPanelController: askPanelController,
+          commandSurface: self.commandSurface
         )
         // The same chrome contract every production window root carries.
         .pensieveSkinAppearance(themeManager)

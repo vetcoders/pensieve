@@ -5,60 +5,53 @@ import XCTest
 @testable import Pensieve
 
 @MainActor
-final class DocumentAskThreadTests: XCTestCase {
-  func testUntitledSessionsMintDistinctAskThreadIDsAtBirth() {
-    let first = DocumentSession.untitled()
-    let second = DocumentSession.untitled()
-
-    XCTAssertNotEqual(first.askThreadID, second.askThreadID)
-    XCTAssertNotEqual(first.identity, second.identity)
-    XCTAssertEqual(first.askThreadID, first.askThreadID)
+final class AskThreadTests: XCTestCase {
+  func testThreadUUIDOwnsHistoryAcrossDocumentAndContextChanges() {
+    let store = AskThreadStore(makeAgent: { RecordingAskAgent() })
+    let id = UUID()
+    let file = DocumentRef(id: URL(fileURLWithPath: "/tmp/ask-first.md"))
+    let first = store.thread(for: id, context: AskContext(files: [file]))
+    first.appendDictation("keep this conversation")
+    let same = store.thread(for: id, context: .empty)
+    XCTAssertTrue(first === same)
+    XCTAssertEqual(same.context, AskContext(files: [file]))
+    XCTAssertEqual(same.turns.map(\.text), ["keep this conversation"])
   }
 
-  func testSaveAsAndRenameKeepTheBirthAskThreadID() {
-    var session = DocumentSession.untitled(title: "Draft.md")
-    let birth = session.askThreadID
-    let saved = URL(fileURLWithPath: "/tmp/pensieve-ask/../saved.md")
-    let renamed = URL(fileURLWithPath: "/tmp/pensieve-ask/renamed.md")
-
-    session.document = DocumentRef(id: saved)
-    XCTAssertEqual(session.askThreadID, birth)
-    XCTAssertEqual(session.identity, .file(saved.standardizedFileURL))
-
-    session.document = DocumentRef(id: renamed)
-    XCTAssertEqual(session.askThreadID, birth)
-    XCTAssertEqual(session.identity, .file(renamed.standardizedFileURL))
+  func testNewThreadMintsDistinctUUIDEvenForSameContext() {
+    let store = AskThreadStore(makeAgent: { RecordingAskAgent() })
+    let context = AskContext(draftID: UUID())
+    let first = store.newThread(context: context)
+    let second = store.newThread(context: context)
+    first.draft = "keep my draft"
+    XCTAssertNotEqual(first.id, second.id)
+    XCTAssertEqual(first.context, second.context)
+    XCTAssertEqual(second.draft, "")
+    XCTAssertEqual(context.draftPath, "draft:\(context.draftID!.uuidString.lowercased())")
   }
 
-  func testLoadFromUntitledKeepsAskThreadIDLikeIdentitySaveAs() {
-    var session = DocumentSession.untitled(title: "Draft.md")
-    let birth = session.askThreadID
-    let saved = URL(fileURLWithPath: "/tmp/pensieve-ask-load/saved.md")
-
-    session.load(document: DocumentRef(id: saved), text: "body")
-
-    XCTAssertEqual(session.askThreadID, birth)
-    XCTAssertEqual(session.identity, .file(saved.standardizedFileURL))
+  func testRestorePreservesTurnIdentityAndTextWithoutResurrectingStream() {
+    let turn = AskTurn(role: .assistant, text: "partial", isStreaming: true)
+    let thread = AskThread()
+    thread.restore(turns: [turn], draft: "retry")
+    XCTAssertEqual(thread.turns.first?.id, turn.id)
+    XCTAssertEqual(thread.turns.first?.text, "partial")
+    XCTAssertEqual(thread.turns.first?.isStreaming, false)
+    XCTAssertEqual(thread.draft, "retry")
+    XCTAssertFalse(thread.isBusy)
+    XCTAssertEqual(thread.phase, .idle)
   }
 
-  func testOpeningADifferentFileRemintsAskThreadID() {
-    var session = DocumentSession(
-      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-ask/a.md")),
-      text: "alpha")
-    let firstThread = session.askThreadID
-
-    session.load(
-      document: DocumentRef(id: URL(fileURLWithPath: "/tmp/pensieve-ask/b.md")),
-      text: "beta")
-
-    XCTAssertNotEqual(session.askThreadID, firstThread)
-  }
-
-  func testCreateUntitledRemintsAskThreadID() {
-    var session = DocumentSession.untitled()
-    let first = session.askThreadID
-    session.createUntitled(title: "Untitled 2.md")
-    XCTAssertNotEqual(session.askThreadID, first)
+  func testRejectedContextPreparationKeepsDraftWithoutStartingTurn() {
+    let agent = RecordingAskAgent()
+    let thread = AskThread(makeAgent: { agent })
+    thread.draft = "keep this question"
+    XCTAssertFalse(thread.rejectSubmission("Original workspace is no longer open."))
+    XCTAssertEqual(thread.lastError, "Original workspace is no longer open.")
+    XCTAssertEqual(thread.phase, .failed("Original workspace is no longer open."))
+    XCTAssertEqual(thread.draft, "keep this question")
+    XCTAssertTrue(thread.turns.isEmpty)
+    XCTAssertTrue(agent.texts.isEmpty)
   }
 
   func testAPIKeyProvidersKeepTheKeyRuleAndGrokNeedsItsAccount() {
@@ -79,16 +72,16 @@ final class DocumentAskThreadTests: XCTestCase {
       "the blocked message names the credential that is actually missing")
   }
 
-  func testStreamingPhaseIsObservableAndUsesTheDocumentThreadID() async throws {
-    let agent = RecordingCodescribeAgent()
+  func testStreamingPhaseIsObservableAndUsesTheConversationUUID() async throws {
+    let agent = RecordingAskAgent()
     let threadID = UUID()
-    let thread = DocumentAskThread(id: threadID, agent: agent)
+    let thread = AskThread(id: threadID, makeAgent: { agent })
     thread.draft = "Say hello."
 
     XCTAssertEqual(thread.phase, .idle)
     XCTAssertTrue(
       thread.send(
-        provider: .apiKey("sk-test"), host: AskDocumentFixture.host(text: "note"))
+        text: thread.draft, host: AskCoreFixture.host(text: "note"), provider: .apiKey("sk-test"))
     )
     XCTAssertEqual(thread.phase, .streaming)
     XCTAssertTrue(thread.isStreaming)
@@ -106,8 +99,8 @@ final class DocumentAskThreadTests: XCTestCase {
   }
 
   func testDictationAppendsAnUtteranceWithoutSending() {
-    let agent = RecordingCodescribeAgent()
-    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    let agent = RecordingAskAgent()
+    let thread = AskThread(id: UUID(), makeAgent: { agent })
     thread.appendDictation("  spoken note  ")
     thread.appendDictation("")
 
@@ -118,14 +111,14 @@ final class DocumentAskThreadTests: XCTestCase {
   }
 
   func testLargeDocumentUsesOneAgentTurn() async throws {
-    let agent = RecordingCodescribeAgent()
-    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    let agent = RecordingAskAgent()
+    let thread = AskThread(id: UUID(), makeAgent: { agent })
     let document = String(repeating: "x", count: 8000 * 2 + 20)
     thread.draft = "Continue."
     XCTAssertTrue(
       thread.send(
-        provider: .apiKey("sk-test"),
-        host: AskDocumentFixture.host(text: document)))
+        text: thread.draft, host: AskCoreFixture.host(text: document), provider: .apiKey("sk-test"))
+    )
 
     let finished = await waitUntil(timeout: 1.0) { thread.phase == .completed }
     XCTAssertTrue(finished)
@@ -135,21 +128,21 @@ final class DocumentAskThreadTests: XCTestCase {
   }
 
   func testSendReadsTheLiveDocumentOnDemand() async {
-    let agent = RecordingCodescribeAgent()
-    let thread = DocumentAskThread(id: UUID(), agent: agent)
+    let agent = RecordingAskAgent()
+    let thread = AskThread(id: UUID(), makeAgent: { agent })
     thread.draft = "Find the decision."
     XCTAssertTrue(
       thread.send(
-        provider: .apiKey("test"),
-        host: AskDocumentFixture.host(text: "CURRENT decision")))
+        text: thread.draft, host: AskCoreFixture.host(text: "CURRENT decision"),
+        provider: .apiKey("test")))
     let finished = await waitUntil(timeout: 1) { thread.phase == .completed }
     XCTAssertTrue(finished)
     XCTAssertFalse(agent.texts.joined().contains("OLD decision"))
     XCTAssertTrue(agent.documentReads.joined().contains("CURRENT decision"))
   }
 
-  func testStoreReusesTheSameThreadObjectForABirthID() {
-    let store = DocumentAskThreadStore(makeAgent: { RecordingCodescribeAgent() })
+  func testStoreReusesTheSameThreadObjectForAConversationUUID() {
+    let store = AskThreadStore(makeAgent: { RecordingAskAgent() })
     let id = UUID()
     let first = store.thread(for: id)
     first.appendDictation("keep me")
@@ -160,11 +153,11 @@ final class DocumentAskThreadTests: XCTestCase {
   }
 
   func testStopCancelsEngineAndIgnoresLateEvents() async {
-    let agent = SuspendedDocumentAgent()
-    let thread = DocumentAskThread(id: UUID(), agent: agent)
-    let host = AskDocumentFixture.host(text: "unsaved")
+    let agent = SuspendedAskAgent()
+    let thread = AskThread(id: UUID(), makeAgent: { agent })
+    let host = AskCoreFixture.host(text: "unsaved")
     thread.draft = "Edit this"
-    XCTAssertTrue(thread.send(provider: .apiKey("test"), host: host))
+    XCTAssertTrue(thread.send(text: thread.draft, host: host, provider: .apiKey("test")))
     let started = await waitUntil(timeout: 1) { agent.started }
     XCTAssertTrue(started)
     thread.cancel()
@@ -186,7 +179,7 @@ final class DocumentAskThreadTests: XCTestCase {
   }
 }
 
-private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendable {
+private final class RecordingAskAgent: AskAgentStreaming, @unchecked Sendable {
   private struct State: Sendable {
     var texts: [String] = []
     var threadIDs: [String] = []
@@ -210,8 +203,8 @@ private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @uncheck
     sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
   ) -> Bool { false }
 
-  func streamDocument(
-    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+  func streamWorkspace(
+    text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?,
     listener: CsAgentListener
   ) async throws
     -> String
@@ -220,7 +213,7 @@ private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @uncheck
       $0.texts.append(text)
       $0.threadIDs.append(threadId)
     }
-    let read = try document.execute(
+    let read = try workspace.execute(
       name: "document_read", argumentsJson: "{\"offset\":0,\"limit\":8000}")
     state.withLock { $0.documentReads.append(read) }
     listener.onTextDelta(delta: "Hel")
@@ -231,7 +224,7 @@ private final class RecordingCodescribeAgent: CodescribeAgentStreaming, @uncheck
   }
 }
 
-private final class SuspendedDocumentAgent: CodescribeAgentStreaming, Sendable {
+private final class SuspendedAskAgent: AskAgentStreaming, Sendable {
   private struct State: Sendable {
     var listener: CsAgentListener?
     var completion: CheckedContinuation<String, Never>?
@@ -240,8 +233,8 @@ private final class SuspendedDocumentAgent: CodescribeAgentStreaming, Sendable {
   private let state = Mutex(State())
   var started: Bool { state.withLock { $0.completion != nil } }
   var cancelledThread: String? { state.withLock { $0.cancelledThread } }
-  func streamDocument(
-    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+  func streamWorkspace(
+    text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?,
     listener: CsAgentListener
   ) async throws -> String {
     await withCheckedContinuation { completion in
@@ -269,5 +262,14 @@ private final class SuspendedDocumentAgent: CodescribeAgentStreaming, Sendable {
     pending.0?.onTextDelta(delta: "late reply")
     pending.0?.onTextDone(text: "late reply")
     pending.1?.resume(returning: "late reply")
+  }
+}
+
+@MainActor
+private enum AskCoreFixture {
+  static func host(text: String) -> WorkspaceToolHost {
+    WorkspaceToolHost(
+      search: { _, _ in "{}" }, containsPath: { _ in false }, readFile: { _ in text },
+      initialDocument: ("fixture", AskDocumentFixture.host(text: text)))
   }
 }

@@ -27,21 +27,29 @@ _𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)20
 
 ## Ask
 
-Ask uses Pensieve's embedded Codescribe engine. Document Ask reads and edits the
-live buffer, including unsaved text, with Undo/Redo. Workspace Ask searches the
-index, opens or activates document tabs, and uses the same document tools.
-Both scopes share one conversation surface: a resizable dock (or an optional
-in-window float) with a native Markdown transcript — headings, lists, quotes,
-tasks, links, code and tables, with full-source selection and copy — and one
-header carrying the scope switch, provider choice and readiness. Images attach
-from the file picker, paste, or drop, with removable preview chips; a send
-validates them off the main thread and joins the exact images to that turn.
+Ask uses Pensieve's embedded Codescribe engine and one conversation model.
+Each thread keeps its starting context: no files, one file, several open files,
+or a workspace. **New thread** captures the current selection; its menu also
+lets you choose those starting contexts. Opening another tab leaves the current
+thread's context unchanged. Context chips show what the agent can reach, and
+**Previous threads** restores saved conversations and drafts.
+
+The agent reads and edits live buffers, including unsaved text, with Undo/Redo.
+Workspace context adds index search and document opening within the chosen roots.
+The conversation surface is a resizable dock (or an optional in-window float)
+with a native Markdown transcript — headings, lists, quotes, tasks, links, code
+and tables, with full-source selection and copy — and provider choice and
+readiness in the header. Images attach from the file picker, paste, or drop,
+with removable preview chips; a send validates them off the main thread and
+joins the exact images to that turn.
 Enter submits; Shift+Enter inserts a newline; IME composition never submits.
 Submitting a question does not
 preload the entire document: the agent searches and requests bounded excerpts, including
 the tail and later search matches, as needed for the task. A genuinely loopback
 Responses endpoint (localhost, 127.0.0.1 or ::1) with a configured model runs
 without an API key; remote providers keep the existing key and sign-in rules.
+Thread storage and restart behavior are described in
+[Ask history](docs/architecture/ask-history.md).
 
 ## Current AI and dictation limits
 

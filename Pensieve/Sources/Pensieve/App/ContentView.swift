@@ -10,21 +10,13 @@ struct ContentView: View {
   @EnvironmentObject private var themeManager: ThemeManager
   @ObservedObject private var providerOnboardingCoordinator: ProviderOnboardingCoordinator
   @StateObject private var providerSettingsTransition: ProviderOnboardingSettingsTransition
-  @StateObject private var askThreads: DocumentAskThreadStore
+  @StateObject private var askThreads: AskThreadStore
   @State private var lastIngestedDictation = ""
-  /// Shared with the status bar's Ask chip and the surface's hide control —
-  /// one key, three surfaces. Default visible preserves the pre-toggle behavior.
-  @AppStorage("pensieve.ask.visible") private var askVisible = true
-  /// The assembled surface's remembered geometry: presentation mode, the
-  /// user-resized dock height, and expansion. Hidden is NOT stored here — it
-  /// is `pensieve.ask.visible`, synced both ways below.
-  @AppStorage("pensieve.ask.presentationMode") private var askModeRaw =
-    AskPresentationMode.docked.rawValue
-  @AppStorage("pensieve.ask.dockHeight") private var askDockHeight = 0.0
-  @AppStorage("pensieve.ask.expanded") private var askExpanded = true
-  @State private var askPresentation = AskPresentationState.expandedDefault
-  @State private var askPresentationLoaded = false
-  @StateObject private var askPanelController = AskPanelController()
+  @ObservedObject private var askPanelController: AskPanelController
+  @ObservedObject private var commandSurface: CommandSurfaceContext
+
+  private var askPresentation: AskPresentationState { askPanelController.presentation }
+  private var ownsAsk: Bool { commandSurface.controller === controller }
   @Binding private var hostWindow: NSWindow?
   @ObservedObject private var providerSettings: ProviderSettings
 
@@ -33,9 +25,14 @@ struct ContentView: View {
     hostWindow: Binding<NSWindow?> = .constant(nil),
     providerSettings: ProviderSettings = .shared,
     providerOnboardingCoordinator: ProviderOnboardingCoordinator? = nil,
-    askThreads: DocumentAskThreadStore? = nil
+    askThreads: AskThreadStore? = nil,
+    askPanelController: AskPanelController? = nil,
+    commandSurface: CommandSurfaceContext = .shared
   ) {
-    _askThreads = StateObject(wrappedValue: askThreads ?? DocumentAskThreadStore())
+    let session = askPanelController ?? .shared
+    _askPanelController = ObservedObject(wrappedValue: session)
+    _commandSurface = ObservedObject(wrappedValue: commandSurface)
+    _askThreads = StateObject(wrappedValue: askThreads ?? session.threads)
     _hostWindow = hostWindow
     _providerSettings = ObservedObject(wrappedValue: providerSettings)
     _providerOnboardingCoordinator = ObservedObject(
@@ -44,73 +41,15 @@ struct ContentView: View {
       wrappedValue: ProviderOnboardingSettingsTransition())
   }
 
-  private func makeDocumentHost() -> DocumentToolHost {
-    controller.makeAgentDocumentHost()
-  }
-
-  /// First-mount restore of the assembled surface: persisted mode, dock
-  /// height and expansion, with hidden read from the shared visibility key.
-  private func loadAskPresentation() {
-    guard !askPresentationLoaded else { return }
-    askPresentationLoaded = true
-    var state = AskPresentationState.expandedDefault
-    state.isExpanded = askExpanded
-    if askDockHeight > 0 { state.preferredDockHeight = askDockHeight }
-    state.mode =
-      askVisible
-      ? (AskPresentationMode(rawValue: askModeRaw) ?? .docked) : .hidden
-    askPresentation = state
-    askPanelController.presentation = state
-    askPanelController.onPresentationChange = { [self] newState in
-      if askPresentation != newState {
-        askPresentation = newState
-      }
-    }
-  }
-
-  /// The status-bar chip (or dictation) flipped visibility: move the surface,
-  /// remembering the non-hidden mode it returns to.
-  private func syncAskVisibility(_ visible: Bool) {
-    guard askPresentationLoaded else { return }
-    if visible {
-      if askPresentation.mode == .hidden {
-        askPresentation.mode = AskPresentationMode(rawValue: askModeRaw) ?? .docked
-      }
-    } else if askPresentation.mode != .hidden {
-      askPresentation.mode = .hidden
-    }
-    askPanelController.presentation = askPresentation
-  }
-
-  /// The surface moved (hide button, float/dock, drag): write visibility back
-  /// to the shared key and remember geometry. Guards keep the two stores
-  /// from bouncing each other.
-  private func persistAskPresentation(_ state: AskPresentationState) {
-    guard askPresentationLoaded else { return }
-    if state.mode == .hidden, askVisible { askVisible = false }
-    if state.mode != .hidden {
-      if !askVisible { askVisible = true }
-      if askModeRaw != state.mode.rawValue { askModeRaw = state.mode.rawValue }
-    }
-    if askDockHeight != state.preferredDockHeight {
-      askDockHeight = state.preferredDockHeight
-    }
-    if askExpanded != state.isExpanded { askExpanded = state.isExpanded }
-    if askPanelController.presentation != state {
-      askPanelController.presentation = state
-    }
-  }
-
   var body: some View {
     NavigationSplitView {
       SidebarView()
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     } detail: {
       GeometryReader { proxy in
-        let askEligible =
-          appState.documentHasEditableBuffer || !appState.workspaceRoots.isEmpty
+        let askEligible = true
         let dockPlaceholder =
-          askEligible && askPresentation.mode == .docked
+          askEligible && ownsAsk && askPresentation.mode == .docked
           ? AskSurfaceLayout.displayedDockHeight(
             presentation: askPresentation, content: proxy.size) : 0
         ZStack(alignment: .topLeading) {
@@ -139,56 +78,42 @@ struct ContentView: View {
             if appState.documentHasEditableBuffer {
               EditorStatusBar()
                 .environmentObject(askThreads)
+                .environmentObject(askPanelController)
                 .opacity(appState.mode == .focus ? 0.45 : 1)
             }
           }
-          if askEligible {
+          if askEligible || ownsAsk {
             AskPanelHostView(
               controller: askPanelController,
-              presentation: $askPresentation,
+              presentation: $askPanelController.presentation,
               contentSize: proxy.size,
-              hostWindow: hostWindow
+              hostWindow: hostWindow,
+              isActive: ownsAsk && askEligible,
+              theme: themeManager.skin
             ) {
               AskSurfaceHost(
                 providerSettings: providerSettings,
                 askThreads: askThreads,
-                presentation: $askPresentation,
-                makeDocumentHost: makeDocumentHost
+                threadID: askPanelController.activeThreadID,
+                ownerContentSize: proxy.size,
+                presentation: $askPanelController.presentation,
+                askPanelController: askPanelController
               )
               .environment(appState)
               .environmentObject(controller)
               .environmentObject(themeManager)
               .environmentObject(askThreads)
+              .preferredColorScheme(WindowChromeRecipe.skinChrome(for: themeManager.skin).window)
+              .ignoresSafeArea(.container, edges: .top)
             }
           }
         }
-        .onAppear { loadAskPresentation() }
-        .onChange(of: askVisible) { _, visible in
-          syncAskVisibility(visible)
-        }
-        .onChange(of: askPresentation) { _, state in
-          persistAskPresentation(state)
-        }
       }
     }
-    .task(id: appState.documentHasEditableBuffer ? appState.documentSession.askThreadID : nil) {
-      if askVisible, appState.documentHasEditableBuffer {
-        _ = askThreads.thread(for: appState.documentSession.askThreadID)
+    .task(id: ownsAsk && askPanelController.isVisible) {
+      if ownsAsk, askPanelController.isVisible {
+        _ = askPanelController.ensureThread(context: AskContextSelection.current(in: appState))
       }
-    }
-    .onChange(of: askVisible) { _, visible in
-      if visible, appState.documentHasEditableBuffer {
-        _ = askThreads.thread(for: appState.documentSession.askThreadID)
-      }
-    }
-    .onChange(of: appState.documentSession.askThreadID) { oldID, _ in
-      askThreads.existingThread(for: oldID)?.cancel()
-    }
-    .onDisappear { askThreads.cancelAll() }
-    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) {
-      notification in
-      guard let closing = notification.object as? NSWindow, closing === hostWindow else { return }
-      askThreads.cancelAll()
     }
     .navigationTitle(
       DocumentWindowSurface.navigationTitle(
@@ -346,9 +271,10 @@ struct ContentView: View {
     }
     lastIngestedDictation = trimmed
     guard !utterance.isEmpty else { return }
-    askThreads.thread(for: appState.documentSession.askThreadID).appendDictation(utterance)
+    askPanelController.ensureThread(context: AskContextSelection.current(in: appState))
+      .appendDictation(utterance)
     // Dictation landing in a hidden composer is feedback nobody sees. Reopen it.
-    askVisible = true
+    askPanelController.setVisible(true)
   }
 
   private func saveRecoveredFileAs() {
@@ -704,75 +630,64 @@ private struct RecoveredDraftRow: View {
   }
 }
 
-/// The assembled Ask surface: one dock/float surface whose conversation slots
-/// switch between the document and workspace scopes. Threads, drafts and
-/// attachments stay in their owning thread objects, so a scope or
-/// presentation switch never starts a second session, submits twice, or
-/// loses input. The shared `AskConversationModel` keeps its parse cache
-/// across both.
+/// One dock/float surface for the active UUID conversation. Context, turns,
+/// drafts and attachments belong to that thread, independently of the selected
+/// document. The shared transcript model resets only when another thread opens.
 private struct AskSurfaceHost: View {
   @Environment(AppState.self) private var appState
   @EnvironmentObject private var controller: AppController
   @ObservedObject var providerSettings: ProviderSettings
-  @ObservedObject var askThreads: DocumentAskThreadStore
+  @ObservedObject var askThreads: AskThreadStore
+  let threadID: UUID
+  let ownerContentSize: CGSize
   @Binding var presentation: AskPresentationState
-  let makeDocumentHost: @MainActor () -> DocumentToolHost
+  @ObservedObject var askPanelController: AskPanelController
 
   @ObservedObject private var grokAccount = GrokAccount.shared
   @ObservedObject private var codexAccount = CodexAccount.shared
   @StateObject private var conversation = AskConversationModel()
-  @AppStorage("pensieve.ask.workspaceSelected") private var workspaceAskSelected = false
-  @State private var workspaceThread: WorkspaceAskThread?
 
-  private var hasDocumentBuffer: Bool { appState.documentHasEditableBuffer }
-  private var hasWorkspace: Bool { !appState.workspaceRoots.isEmpty }
-
-  private var workspaceScopeActive: Bool {
-    hasWorkspace && (workspaceAskSelected || !hasDocumentBuffer)
-  }
-
-  private var documentThread: DocumentAskThread? {
-    askThreads.existingThread(for: appState.documentSession.askThreadID)
-  }
-
+  private var thread: AskThread? { askThreads.existingThread(for: threadID) }
   private var usesAccountProvider: Bool {
     grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
   }
-
   private var provider: AskProvider {
     grokAccount.snapshot.askUsesGrok
       ? grokAccount.snapshot.askProvider(apiKey: providerSettings.apiKey)
       : codexAccount.snapshot.askProvider(apiKey: providerSettings.apiKey)
   }
-
   private var apiConfiguration: CsDocumentProvider {
     CsDocumentProvider(
       wire: providerSettings.providerShape.rawValue,
       endpoint: providerSettings.providerShape.normalizeEndpoint(providerSettings.endpoint),
-      model: providerSettings.model,
-      apiKey: providerSettings.apiKey)
+      model: providerSettings.model, apiKey: providerSettings.apiKey)
   }
-
   private var readinessContext: AskEndpointContext? {
     usesAccountProvider ? nil : AskEndpointContext(configuration: apiConfiguration)
   }
 
-  private var activeIsBusy: Bool {
-    workspaceScopeActive
-      ? workspaceThread?.isBusy ?? false
-      : documentThread?.isStreaming ?? false
-  }
-
   var body: some View {
-    AskSurface(presentation: $presentation) { compact in
-      headerSlot(compact: compact)
+    AskSurface(presentation: $presentation, dockOwnerSize: ownerContentSize) { compact in
+      newThreadMenu(compact: compact)
+      historyMenu
+      AskProviderHeader(
+        grokAccount: grokAccount, codexAccount: codexAccount,
+        apiKey: providerSettings.apiKey, apiKeyProvider: providerSettings.providerShape,
+        readinessContext: readinessContext, isStreaming: thread?.isBusy ?? false,
+        compact: compact)
     } transcript: {
-      transcriptSlot
+      if let thread {
+        AskThreadObservation(thread: thread) { observed in
+          VStack(spacing: 4) {
+            contextChips(observed.context)
+            composer(observed).transcript
+          }
+        }
+      }
     } composer: {
-      composerSlot
-    }
-    .task(id: appState.workspaceRoots.map(\.url)) {
-      await refreshWorkspaceThread()
+      if let thread {
+        AskThreadObservation(thread: thread) { observed in composer(observed).composer }
+      }
     }
     .task {
       await grokAccount.refreshIfStale()
@@ -780,116 +695,123 @@ private struct AskSurfaceHost: View {
       await grokAccount.adoptGrokForAskIfSignedIn()
       await codexAccount.adoptCodexForAskIfSignedIn()
     }
-    .onChange(of: workspaceScopeActive) { _, _ in conversation.replaceThread() }
-    .onChange(of: appState.documentSession.askThreadID) { _, _ in conversation.replaceThread() }
-    .onChange(of: workspaceThread?.identity.workspaceID) { _, _ in conversation.replaceThread() }
-  }
-
-  @ViewBuilder private func headerSlot(compact: Bool) -> some View {
-    if !workspaceScopeActive, let thread = documentThread {
-      AskDocumentThreadObservation(thread: thread) { observed in
-        providerHeader(isStreaming: observed.isStreaming, compact: compact)
-      }
-    } else {
-      providerHeader(isStreaming: activeIsBusy, compact: compact)
+    .onChange(of: threadID) { _, _ in
+      conversation.replaceThread()
+      if let thread { conversation.observe(turns: thread.turns) }
     }
   }
 
-  private func providerHeader(isStreaming: Bool, compact: Bool) -> some View {
-    AskProviderHeader(
-      showsScopePicker: hasWorkspace,
-      workspaceSelected: $workspaceAskSelected,
-      documentScopeEnabled: hasDocumentBuffer,
-      workspaceScopeEnabled: hasWorkspace,
-      grokAccount: grokAccount,
-      codexAccount: codexAccount,
-      apiKey: providerSettings.apiKey,
-      apiKeyProvider: providerSettings.providerShape,
-      readinessContext: readinessContext,
-      isStreaming: isStreaming,
-      compact: compact)
-  }
-
-  @ViewBuilder private var transcriptSlot: some View {
-    if workspaceScopeActive {
-      if let thread = workspaceThread {
-        workspaceComposer(thread).transcript
-      } else {
-        Color.clear
-      }
-    } else if let thread = documentThread {
-      AskDocumentThreadObservation(thread: thread) { observed in
-        documentComposer(observed).transcript
-      }
-    } else {
-      Color.clear
-    }
-  }
-
-  @ViewBuilder private var composerSlot: some View {
-    if workspaceScopeActive {
-      if let thread = workspaceThread {
-        workspaceComposer(thread).composer
-      } else {
-        Color.clear
-      }
-    } else if let thread = documentThread {
-      AskDocumentThreadObservation(thread: thread) { observed in
-        documentComposer(observed).composer
-      }
-    } else {
-      Color.clear
-    }
-  }
-
-  private func documentComposer(_ thread: DocumentAskThread) -> AskComposerView {
+  private func composer(_ thread: AskThread) -> AskComposerView {
     AskComposerView(
-      thread: thread,
-      grokAccount: grokAccount,
-      codexAccount: codexAccount,
-      apiKey: providerSettings.apiKey,
-      makeDocumentHost: makeDocumentHost,
-      apiConfiguration: apiConfiguration,
-      conversation: conversation)
-  }
-
-  private func workspaceComposer(_ thread: WorkspaceAskThread) -> WorkspaceAskComposer {
-    WorkspaceAskComposer(
-      thread: thread,
-      conversation: conversation,
-      provider: provider,
+      thread: thread, conversation: conversation, provider: provider,
       readinessContext: readinessContext,
+      providerError: grokAccount.lastError ?? codexAccount.lastError,
+      historyError: askThreads.historyError,
       onSubmit: { [weak controller] prompt in
-        await thread.prepareAndSend(
-          text: prompt,
-          documents: appState.workspaceStore.documents,
-          database: .shared,
-          provider: provider,
-          configuration: usesAccountProvider ? nil : apiConfiguration,
+        guard let controller, askPanelController.activeThreadID == thread.id else { return false }
+        guard
+          let documents = AskContextSelection.documents(for: thread.context, controller: controller)
+        else {
+          return thread.rejectSubmission(
+            "The workspace for this thread is closed. Open it again or start a new thread.")
+        }
+        let seed = AskContextSelection.initialDocument(for: thread.context, controller: controller)
+        return await thread.prepareAndSend(
+          text: prompt, documents: documents, database: .shared,
+          provider: provider, configuration: usesAccountProvider ? nil : apiConfiguration,
+          initialDocument: seed,
           openDocument: { [weak controller] ref, isActive in
             guard let controller else { throw CsError.Agent(msg: "The window was closed.") }
-            workspaceAskSelected = true
-            return try await controller.openAgentDocument(ref, isActive: isActive)
+            return try await AskContextSelection.openDocument(
+              ref, context: thread.context, controller: controller, isActive: isActive)
           })
       })
   }
 
-  /// Session creation belongs to a root-change task, never a view-body read.
-  private func refreshWorkspaceThread() async {
-    let roots = appState.workspaceRoots.map(\.url)
-    guard !roots.isEmpty else {
-      workspaceThread?.cancel()
-      workspaceThread = nil
-      return
+  private func newThreadMenu(compact: Bool) -> some View {
+    Menu {
+      Button("With current selection") {
+        askPanelController.newThread(context: AskContextSelection.current(in: appState))
+      }
+      Button("Without context") { askPanelController.newThread(context: .empty) }
+      if appState.documentHasEditableBuffer {
+        Button("With current file") {
+          askPanelController.newThread(context: AskContextSelection.document(in: appState))
+        }
+      }
+      if !appState.openFiles.isEmpty {
+        Button("With open files") {
+          askPanelController.newThread(context: AskContext(roots: [], files: appState.openFiles))
+        }
+      }
+      if !appState.workspaceRoots.isEmpty {
+        Button("With workspace") {
+          askPanelController.newThread(
+            context: AskContext(roots: Set(appState.workspaceRoots.map(\.url)), files: []))
+        }
+      }
+    } label: {
+      if compact { Image(systemName: "plus.bubble") } else { Text("New thread") }
+    } primaryAction: {
+      askPanelController.newThread(context: AskContextSelection.current(in: appState))
     }
-    let bookmark = appState.workspaceStore.bookmarkData
-    let identity = await Task.detached {
-      WorkspaceIdentity.make(roots: roots, bookmarkData: bookmark)
-    }.value
-    guard !Task.isCancelled else { return }
-    if let workspaceThread, workspaceThread.identity.workspaceID != identity.workspaceID {
-      workspaceThread.cancel()
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .accessibilityLabel("New thread")
+    .accessibilityIdentifier("pensieve.ask.newThread")
+    .help("Start a new conversation with the current selection. Context stays with that thread.")
+  }
+
+  private var historyMenu: some View {
+    Menu {
+      ForEach(askThreads.historyRecords.prefix(50)) { record in
+        Button {
+          askPanelController.activateThread(record.id)
+        } label: {
+          Text(
+            record.turns.first(where: { $0.role == .user })?.text.prefix(60).description
+              ?? "New conversation")
+        }
+      }
+    } label: {
+      Image(systemName: "clock.arrow.circlepath")
     }
-    workspaceThread = WorkspaceAskThreadStore.shared.thread(for: identity)
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .accessibilityLabel("Previous threads")
+    .accessibilityIdentifier("pensieve.ask.history")
+  }
+
+  private func contextChips(_ context: AskContext) -> some View {
+    ScrollView(.horizontal) {
+      HStack(spacing: 6) {
+        if context.roots.isEmpty && context.files.isEmpty && context.draftID == nil {
+          contextChip(
+            "Chat", symbol: "bubble.left", detail: "No files are in this thread's context")
+        }
+        if context.draftID != nil {
+          contextChip("Untitled", symbol: "doc.text", detail: "The original unsaved buffer")
+        }
+        ForEach(context.roots.sorted(by: { $0.path < $1.path }), id: \.self) { root in
+          contextChip(root.lastPathComponent, symbol: "folder", detail: root.path)
+        }
+        ForEach(context.files) { file in
+          contextChip(file.url.lastPathComponent, symbol: "doc.text", detail: file.url.path)
+        }
+      }
+      .padding(.horizontal, 12)
+    }
+    .scrollIndicators(.hidden)
+    .frame(height: 24)
+    .accessibilityIdentifier("pensieve.ask.context")
+  }
+
+  private func contextChip(_ title: String, symbol: String, detail: String) -> some View {
+    Label(title, systemImage: symbol)
+      .font(.system(size: 10.5))
+      .padding(.horizontal, 6).padding(.vertical, 3)
+      .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+      .help(detail)
+      .accessibilityLabel(detail)
   }
 }

@@ -1605,16 +1605,39 @@ final class AppController: ObservableObject {
   /// workspace click. Return tools bound to the actual owning controller,
   /// never to whichever window happens to have desktop focus.
   func openAgentDocument(
-    _ ref: DocumentRef, isActive: @escaping @Sendable () -> Bool
+    _ ref: DocumentRef, context: AskContext? = nil, isActive: @escaping @Sendable () -> Bool
   ) async throws -> DocumentToolHost {
-    guard isActive(), !ref.isAdHoc, let root = ref.rootURL,
-      appState.workspaceRoots.contains(where: {
-        $0.url.standardizedFileURL == root.standardizedFileURL
-      }),
-      appState.allDocuments.contains(where: { $0.id == ref.id })
-    else { throw CsError.Agent(msg: "The document is no longer in this workspace.") }
-    openDocumentWindow(id: ref.id)
-    let identity = DocumentIdentity.file(ref.url.standardizedFileURL)
+    guard isActive() else { throw CsError.Agent(msg: "The Ask request was stopped.") }
+    let canonical = ref.url.standardizedFileURL.resolvingSymlinksInPath()
+    let availableRef = appState.allDocuments.first {
+      $0.url.standardizedFileURL.resolvingSymlinksInPath() == canonical
+    }
+    let identity = DocumentIdentity.file(availableRef?.url.standardizedFileURL ?? canonical)
+    let explicit = context?.files.contains { $0.url == canonical } == true
+    let inWorkspace =
+      availableRef.map { available in
+        !available.isAdHoc
+          && available.rootURL.map { root in
+            appState.workspaceRoots.contains {
+              $0.url.standardizedFileURL.resolvingSymlinksInPath()
+                == root.standardizedFileURL.resolvingSymlinksInPath()
+            }
+          } == true
+      } ?? false
+    let contextAllowsWorkspace =
+      context.map { selected in
+        selected.roots.contains { root in
+          AskContext.canonicalURL(root) == root && WorkspaceScanner.contains(canonical, in: root)
+        }
+      } ?? true
+    guard explicit || (inWorkspace && contextAllowsWorkspace) else {
+      throw CsError.Agent(msg: "The file is outside this thread's context.")
+    }
+    if let availableRef {
+      openDocumentWindow(id: availableRef.id)
+    } else {
+      openFile(url: canonical)
+    }
     let deadline = ContinuousClock.now + .seconds(30)
     while isActive(), ContinuousClock.now < deadline {
       try Task.checkCancellation()
@@ -1633,6 +1656,27 @@ final class AppController: ObservableObject {
     throw CsError.Agent(
       msg: isActive()
         ? "The document did not finish opening." : "The workspace request was stopped.")
+  }
+
+  var askWorkspaceSnapshot: (roots: Set<URL>, documents: [DocumentRef]) {
+    (
+      Set(appState.workspaceRoots.map { $0.url.standardizedFileURL.resolvingSymlinksInPath() }),
+      appState.workspaceStore.documents
+    )
+  }
+
+  /// The live seed is a capability for the originally selected buffer only.
+  func makeInitialAskDocumentHost(
+    for context: AskContext
+  ) -> (path: String, host: DocumentToolHost)? {
+    guard appState.documentHasEditableBuffer else { return nil }
+    if context.draftID == appState.documentSession.askThreadID, let path = context.draftPath {
+      return (path, makeAgentDocumentHost())
+    }
+    guard let url = appState.documentURL?.standardizedFileURL.resolvingSymlinksInPath(),
+      let file = context.files.first(where: { $0.url == url })
+    else { return nil }
+    return (file.url.path, makeAgentDocumentHost())
   }
 
   func makeAgentDocumentHost() -> DocumentToolHost {

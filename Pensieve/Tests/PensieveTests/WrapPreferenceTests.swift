@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 @testable import Pensieve
@@ -57,6 +58,44 @@ final class WrapPreferenceTests: XCTestCase {
     XCTAssertFalse(surface.textView.autoresizingMask.contains(.width))
     XCTAssertTrue(surface.scrollView.hasHorizontalScroller)
     XCTAssertEqual(surface.textContainer.size.width, CGFloat.greatestFiniteMagnitude)
+  }
+
+  @MainActor
+  func testLongLineActuallyUnwrapsAndWrapsAgain() {
+    let text = String(repeating: "abcdefghij ", count: 100)
+    let surface = MarkdownEditorSurface(
+      text: text, fontSize: 14, syntaxHighlightingEnabled: false)
+    surface.scrollView.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
+    surface.scrollView.layoutSubtreeIfNeeded()
+    surface.textView.setFrameSize(NSSize(width: surface.scrollView.contentSize.width, height: 240))
+    let selection = NSRange(location: 10, length: 7)
+    surface.textView.setSelectedRange(selection)
+
+    func visualRows() -> Int {
+      surface.scrollView.layoutSubtreeIfNeeded()
+      surface.textLayoutManager.ensureLayout(for: surface.textLayoutManager.documentRange)
+      var count = 0
+      surface.textLayoutManager.enumerateTextLayoutFragments(
+        from: surface.textLayoutManager.documentRange.location, options: [.ensuresLayout]
+      ) { fragment in
+        count += fragment.textLineFragments.count
+        return true
+      }
+      return count
+    }
+
+    XCTAssertGreaterThan(visualRows(), 1, "ON must wrap a long logical line")
+    surface.applyWrapPreference(false)
+    surface.textView.sizeToFit()
+    XCTAssertEqual(visualRows(), 1, "OFF must render one visual row")
+    XCTAssertGreaterThan(surface.textView.frame.width, surface.scrollView.contentSize.width)
+    XCTAssertTrue(surface.scrollView.hasHorizontalScroller)
+
+    surface.applyWrapPreference(true)
+    XCTAssertGreaterThan(visualRows(), 1, "Returning to ON must restore viewport-width wrapping")
+    XCTAssertLessThanOrEqual(surface.textView.frame.width, surface.scrollView.contentSize.width + 1)
+    XCTAssertEqual(surface.textView.selectedRange(), selection)
+    XCTAssertEqual(surface.textStorage.string, text)
   }
 
   @MainActor

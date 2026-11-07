@@ -8,6 +8,117 @@ import XCTest
 /// newest document — and a stale failure must never overwrite a newer page.
 final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
+  @MainActor
+  func testRepeatedProcessDeathsPauseUntilExplicitResumeWithNewestContent() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var loads: [PreviewDocument] = []
+    view.fullPageLoadObserver = { loads.append($0) }
+    view.load(document: makeDocument())
+    for _ in 0..<20 { view.handleWebContentProcessTermination() }
+    XCTAssertEqual(loads.count, 3, "initial load and two automatic retries only")
+    XCTAssertTrue(view.isRecoveryPaused)
+
+    let newest = makeDocument(body: "<p>edited while paused</p>")
+    view.load(document: newest)
+    XCTAssertEqual(loads.count, 3, "typing must not restart a crashing renderer")
+    view.resumePreview()
+    XCTAssertFalse(view.isRecoveryPaused)
+    XCTAssertEqual(loads.count, 4)
+    XCTAssertEqual(loads.last, newest)
+  }
+
+  @MainActor
+  func testManualRefreshResetsTheRecoveryBudget() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var loads = 0
+    view.fullPageLoadObserver = { _ in loads += 1 }
+    view.load(document: makeDocument())
+    for _ in 0..<3 { view.handleWebContentProcessTermination() }
+    XCTAssertTrue(view.isRecoveryPaused)
+    view.load(document: makeDocument(refreshToken: 1))
+    XCTAssertFalse(view.isRecoveryPaused)
+    view.handleWebContentProcessTermination()
+    XCTAssertEqual(loads, 5)
+  }
+
+  @MainActor
+  func testUpdatesCoalesceToOneInFlightAndNewestSuccessor() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var scripts: [String] = []
+    var completions: [(Any?, Error?) -> Void] = []
+    view.updateScriptEvaluator = { script, completion in
+      scripts.append(script)
+      completions.append(completion)
+    }
+    view.load(document: makeDocument())
+    view.load(document: makeDocument(body: "<p>first</p>"))
+    for value in 0..<100 {
+      view.load(document: makeDocument(body: "<p>queued-\(value)</p>"))
+    }
+    XCTAssertEqual(scripts.count, 1)
+    completions[0](true, nil)
+    XCTAssertEqual(scripts.count, 2)
+    XCTAssertTrue(scripts[1].contains("queued-99"))
+    completions[1](true, nil)
+    XCTAssertEqual(scripts.count, 2)
+  }
+
+  @MainActor
+  func testOldCompletionCannotReloadOrUnlatchANewerGeneration() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var loads = 0
+    var completions: [(Any?, Error?) -> Void] = []
+    view.fullPageLoadObserver = { _ in loads += 1 }
+    view.updateScriptEvaluator = { _, completion in completions.append(completion) }
+    view.load(document: makeDocument())
+    view.load(document: makeDocument(body: "<p>old update</p>"))
+    view.handleWebContentProcessTermination()
+    view.load(document: makeDocument(body: "<p>new update</p>"))
+    XCTAssertEqual(completions.count, 2)
+
+    completions[0](false, nil)
+    XCTAssertEqual(loads, 2, "same-identity stale failures cannot start a reload storm")
+    view.load(document: makeDocument(body: "<p>newest</p>"))
+    XCTAssertEqual(completions.count, 2, "stale completion cannot clear the new in-flight latch")
+    completions[1](true, nil)
+    XCTAssertEqual(completions.count, 3)
+  }
+
+  @MainActor
+  func testProcessDeathsAndScriptFailuresShareOneBudget() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var loads = 0
+    view.fullPageLoadObserver = { _ in loads += 1 }
+    let document = makeDocument()
+    view.load(document: document)
+    view.handleWebContentProcessTermination()
+    view.handleUpdateScriptResult(false, error: nil, for: document)
+    view.handleWebContentProcessTermination()
+    XCTAssertEqual(loads, 3)
+    XCTAssertTrue(view.isRecoveryPaused)
+  }
+
+  @MainActor
+  func testDismantleInvalidatesLateCallbacksAndFurtherLoads() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    let coordinator = PreviewRepresentable.Coordinator(themeManager: ThemeManager())
+    coordinator.attach(view: view)
+    var loads = 0
+    var completions: [(Any?, Error?) -> Void] = []
+    view.fullPageLoadObserver = { _ in loads += 1 }
+    view.updateScriptEvaluator = { _, completion in completions.append(completion) }
+    view.load(document: makeDocument())
+    view.load(document: makeDocument(body: "<p>pending</p>"))
+    PreviewRepresentable.dismantleNSView(view, coordinator: coordinator)
+    view.invalidate()
+    completions[0](false, nil)
+    view.handleWebContentProcessTermination()
+    view.resumePreview()
+    view.load(document: makeDocument(refreshToken: 1))
+    XCTAssertEqual(loads, 1)
+    XCTAssertEqual(completions.count, 1)
+  }
+
   private func makeDocument(
     body: String = "<p>hello</p>", styleHTML: String = "", refreshToken: Int = 0
   )
@@ -28,7 +139,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
   @MainActor
   func testProcessTerminationReloadsLastDocument() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var fullLoads: [PreviewDocument] = []
     view.fullPageLoadObserver = { fullLoads.append($0) }
 
@@ -43,7 +154,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
   @MainActor
   func testProcessTerminationBeforeAnyLoadIsInert() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var fullLoadCount = 0
     view.fullPageLoadObserver = { _ in fullLoadCount += 1 }
 
@@ -53,7 +164,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
   @MainActor
   func testRecoveryRestoresInPlaceUpdatePathForSameIdentity() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var fullLoadCount = 0
     view.fullPageLoadObserver = { _ in fullLoadCount += 1 }
 
@@ -71,7 +182,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
   @MainActor
   func testStaleUpdateFailureCannotOverwriteNewerPage() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var fullLoads: [PreviewDocument] = []
     view.fullPageLoadObserver = { fullLoads.append($0) }
 
@@ -96,7 +207,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
   /// still must.
   @MainActor
   func testUnchangedStylesheetIsNotReshippedOnEveryInPlaceUpdate() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var scripts: [String] = []
     view.inPlaceUpdateObserver = { scripts.append($0) }
 
@@ -112,6 +223,8 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
       "an unchanged stylesheet must not cross the bridge again")
     XCTAssertFalse(scripts[0].contains("color: red"), scripts[0])
 
+    view.handleUpdateScriptResult(
+      true, error: nil, for: makeDocument(body: "<p>v2</p>", styleHTML: "article { color: red; }"))
     view.load(document: makeDocument(body: "<p>v3</p>", styleHTML: "article { color: blue; }"))
     XCTAssertEqual(scripts.count, 2)
     XCTAssertTrue(
@@ -125,7 +238,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
   /// edit re-ships a stylesheet the page already has (or, worse, the reverse).
   @MainActor
   func testStylesheetBookkeepingFollowsAFullReload() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var scripts: [String] = []
     view.inPlaceUpdateObserver = { scripts.append($0) }
 
@@ -142,7 +255,7 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
 
   @MainActor
   func testUpdateFailureReloadsNewestSameIdentityContent() {
-    let view = PreviewWebView(frame: .zero)
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
     var fullLoads: [PreviewDocument] = []
     view.fullPageLoadObserver = { fullLoads.append($0) }
 

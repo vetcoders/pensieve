@@ -577,6 +577,10 @@ final class AutocompleteControllerTests: XCTestCase {
     })
     let controller = AutocompleteController(engine: engine, debounceNanoseconds: 10_000_000)
 
+    // Condition waits, not durations (see testTransientCompletionErrorDoesNotLatch).
+    // The latch must have landed before cancel(): a cancel racing the in-flight
+    // error is discarded by the request guard, leaving the latch unarmed and
+    // the retry path untested.
     controller.textDidChange(prefix: "hello")
     await waitUntil {
       attempts.value == 1

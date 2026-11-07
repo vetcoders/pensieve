@@ -21,6 +21,7 @@ final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
     search: @escaping @Sendable (String, Int) throws -> String,
     containsPath: @escaping @Sendable (String) -> Bool,
     readFile: @escaping @Sendable (String) throws -> String,
+    initialDocument: (path: String, host: DocumentToolHost)? = nil,
     openDocument: (@Sendable (String, @escaping @Sendable () -> Bool) throws -> DocumentToolHost)? =
       nil
   ) {
@@ -28,6 +29,7 @@ final class WorkspaceToolHost: CsDocumentToolHost, Sendable {
     self.containsPath = containsPath
     self.readFile = readFile
     self.openDocument = openDocument
+    selectedDocument.withLock { $0 = initialDocument }
   }
 
   func isActive() -> Bool { active.withLock { $0 } }

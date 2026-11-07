@@ -18,7 +18,7 @@ final class CodescribeFFIBindingTests: XCTestCase {
     XCTAssertEqual(String(describing: listenerType), "CodescribeListenerBridge")
 
     XCTAssertEqual(String(describing: CodescribeAgent.self), "CodescribeAgent")
-    let streaming: any CodescribeAgentStreaming = FakeCodescribeAgent()
+    let streaming: any AskAgentStreaming = FakeCodescribeAgent()
     XCTAssertEqual(String(describing: type(of: streaming)), "FakeCodescribeAgent")
     XCTAssertEqual(String(describing: CodescribeSTTEngine.self), "CodescribeSTTEngine")
     XCTAssertNotEqual(String(describing: CodescribeSTTEngine.self), "VistaEngine")
@@ -149,10 +149,12 @@ final class CodescribeFFIBindingTests: XCTestCase {
     let agent = FakeCodescribeAgent()
     let collector = CollectingAgentListener()
 
-    let final = try await agent.streamDocument(
+    let final = try await agent.streamWorkspace(
       text: "Say hello in exactly three words.",
       threadId: "ask-thread-1",
-      document: AskDocumentFixture.host(text: "Current unsaved note"), provider: nil,
+      workspace: WorkspaceToolHost(
+        search: { _, _ in #"{"matches":[]}"# }, containsPath: { _ in false },
+        readFile: { _ in throw CsError.Agent(msg: "no files in this fixture") }), provider: nil,
       listener: collector)
 
     XCTAssertEqual(agent.lastText, "Say hello in exactly three words.")
@@ -207,7 +209,8 @@ final class CodescribeFFIBindingTests: XCTestCase {
       delivery: .unattempted,
       acousticReceipts: [],
       sealCoverage: nil,
-      consultationPresentations: [])
+      consultationPresentations: [],
+      uncertainSpans: [])
   }
 }
 
@@ -230,7 +233,7 @@ private final class RecordingDictationListener: DictationEventListener, @uncheck
   func onError(msg: String) { errors.append(msg) }
 }
 
-private final class FakeCodescribeAgent: CodescribeAgentStreaming, @unchecked Sendable {
+private final class FakeCodescribeAgent: AskAgentStreaming, @unchecked Sendable {
   var lastText: String?
   var lastThreadId: String?
 
@@ -239,8 +242,8 @@ private final class FakeCodescribeAgent: CodescribeAgentStreaming, @unchecked Se
     sessionId: String, threadId: String, callId: String, approved: Bool, remember: Bool
   ) -> Bool { false }
 
-  func streamDocument(
-    text: String, threadId: String, document: CsDocumentToolHost, provider: CsDocumentProvider?,
+  func streamWorkspace(
+    text: String, threadId: String, workspace: CsDocumentToolHost, provider: CsDocumentProvider?,
     listener: CsAgentListener
   ) async throws
     -> String

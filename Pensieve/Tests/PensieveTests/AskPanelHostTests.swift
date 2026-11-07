@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 
@@ -6,6 +7,115 @@ import XCTest
 
 @MainActor
 final class AskPanelHostTests: XCTestCase {
+  func testDockRetiresTheFloatingContainerSoItCannotResizeDockedContent() throws {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    let anchor = AskDockAnchorView()
+    fixture.controller.dockAnchorView = anchor
+    let content = NSView()
+    fixture.controller.hostingView = content
+    var state = AskPresentationState.expandedDefault
+    state.mode = .floating
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    state.mode = .docked
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    XCTAssertNil(fixture.panel.contentView, "the hidden panel must not retain a dock sizing writer")
+    XCTAssertTrue(content.superview === anchor)
+    let dockFrame = content.frame
+    fixture.panel.contentView?.setFrameSize(CGSize(width: 360, height: 260))
+    XCTAssertEqual(content.frame, dockFrame)
+  }
+
+  func testFloatingChromeHasOneCloseControlWithoutDetachedTrafficLights() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    var state = AskPresentationState.expandedDefault
+    state.mode = .floating
+    fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+      XCTAssertTrue(fixture.panel.standardWindowButton(button)?.isHidden ?? true)
+    }
+  }
+
+  func testUnchangedNativeSynchronizationPublishesNoSwiftUIUpdates() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    var updates = 0
+    let observation = fixture.controller.$presentation.dropFirst().sink { _ in updates += 1 }
+    let state = fixture.controller.presentation
+    for _ in 0..<100 {
+      fixture.controller.syncPresentation(state, contentSize: CGSize(width: 900, height: 700))
+    }
+    XCTAssertEqual(
+      updates, 0, "layout updates must not feed an invalidation loop on the main thread")
+    withExtendedLifetime(observation) {}
+  }
+
+  func testMultipleDocumentRootsShareOneHostAndExclusiveDockFloatState() throws {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    let defaults = makeEphemeralDefaults(prefix: "one-application-ask")
+    let context = CommandSurfaceContext()
+    let first = WindowErrorChromeRig(
+      defaults: defaults, askSession: fixture.controller, commandSurface: context)
+    defer { first.tearDown() }
+    first.appState.documentSession = .untitled()
+    first.appState.documentSession.text = "First document"
+    first.settle()
+    let thread = fixture.controller.threads.thread(for: fixture.controller.activeThreadID)
+    thread.draft = "Keep this draft when switching documents"
+    thread.appendDictation("One conversation")
+    let second = WindowErrorChromeRig(
+      defaults: defaults, askSession: fixture.controller, commandSurface: context)
+    defer { second.tearDown() }
+    second.appState.documentSession = .untitled()
+    second.appState.documentSession.text = "Second document"
+    second.settle()
+    let host = try XCTUnwrap(fixture.controller.hostingView)
+    fixture.controller.presentation.mode = .floating
+    second.settle()
+    XCTAssertTrue(fixture.isPresented)
+    XCTAssertTrue(host.superview === fixture.panel.contentView)
+    for _ in 0..<3 {
+      context.adopt(appState: first.appState, controller: first.controller)
+      first.settle()
+      XCTAssertTrue(fixture.controller.ownerWindow === first.window)
+      context.adopt(appState: second.appState, controller: second.controller)
+      second.settle()
+      XCTAssertTrue(fixture.controller.ownerWindow === second.window)
+      XCTAssertTrue(fixture.controller.hostingView === host)
+    }
+    fixture.controller.presentation.mode = .docked
+    second.settle()
+    XCTAssertFalse(fixture.isPresented)
+    let anchor = try XCTUnwrap(fixture.controller.dockAnchorView)
+    XCTAssertTrue(anchor.isDocked)
+    XCTAssertTrue(host.superview === anchor)
+    XCTAssertNil(fixture.panel.contentView)
+    XCTAssertEqual(thread.draft, "Keep this draft when switching documents")
+    XCTAssertEqual(thread.turns.count, 1)
+    fixture.controller.setVisible(false)
+    second.settle()
+    XCTAssertFalse(fixture.isPresented)
+    XCTAssertNil(host.superview)
+    fixture.controller.setVisible(true)
+    second.settle()
+    XCTAssertEqual(fixture.controller.presentation.mode, .docked)
+    XCTAssertTrue(fixture.controller.hostingView === host)
+  }
+
+  func testFloatingPanelUsesTheLiveThemeAndRetainsItsIdentity() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+    fixture.controller.presentation.mode = .floating
+    let panel = fixture.panel
+    for theme: PensieveTheme in [.graphite, .parchment, .ink, .porcelain, .default] {
+      fixture.controller.updateTheme(theme)
+      XCTAssertEqual(panel.appearance?.name, WindowChromeRecipe.windowAppearance(for: theme)?.name)
+      XCTAssertTrue(fixture.controller.panel === panel)
+    }
+  }
+
   func testPersistentHostingIdentityAcrossDockFloatAndHide() {
     let fixture = makeFixture()
     defer { fixture.close() }
@@ -148,14 +258,12 @@ final class AskPanelHostTests: XCTestCase {
     anchor.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
     window.contentView = anchor
 
-    class HitTestControl: NSView {
-      override var isFlipped: Bool { true }
-      override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(point) ? self : nil
-      }
-    }
-    let control = HitTestControl(frame: CGRect(x: 400, y: 400, width: 100, height: 40))
+    let control = NSButton(frame: CGRect(x: 400, y: 400, width: 100, height: 40))
     anchor.addSubview(control)
+
+    func hit(_ point: NSPoint) -> NSView? {
+      anchor.hitTest(anchor.convert(point, to: anchor.superview))
+    }
 
     // Docked mode
     let dockRect = CGRect(x: 0, y: 374, width: 900, height: 300)
@@ -163,22 +271,56 @@ final class AskPanelHostTests: XCTestCase {
     anchor.isDocked = true
 
     // Click in editor (y < 374) -> passes through (nil)
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 100)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 100)))
 
     // Click in status bar (y > 674) -> passes through (nil)
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 685)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 685)))
 
     // Click in dock on control -> hits control
-    XCTAssertEqual(anchor.hitTest(NSPoint(x: 450, y: 420)), control)
+    XCTAssertEqual(hit(NSPoint(x: 450, y: 420)), control)
 
     // Click in dock outside control -> hits anchor
-    XCTAssertEqual(anchor.hitTest(NSPoint(x: 100, y: 450)), anchor)
+    XCTAssertEqual(hit(NSPoint(x: 100, y: 450)), anchor)
 
     // Non-docked (floating or hidden) -> passes everything through
     anchor.isDocked = false
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 420)))
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 100)))
-    XCTAssertNil(anchor.hitTest(NSPoint(x: 450, y: 685)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 420)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 100)))
+    XCTAssertNil(hit(NSPoint(x: 450, y: 685)))
+  }
+
+  func testDockedComposerAndCollapseReceiveNativeHitsAfterReopening() {
+    let parent = NSView(frame: CGRect(x: 0, y: 0, width: 1100, height: 900))
+    let anchor = AskDockAnchorView(frame: CGRect(x: 80, y: 100, width: 900, height: 700))
+    parent.addSubview(anchor)
+    let dockRect = CGRect(x: 0, y: 374, width: 900, height: 300)
+    anchor.dockRect = dockRect
+
+    let host = NSView(frame: dockRect)
+    anchor.addSubview(host)
+    let collapse = NSButton(frame: CGRect(x: 790, y: 248, width: 25, height: 25))
+    let draft = AskDraftTextView(frame: CGRect(x: 20, y: 16, width: 760, height: 80))
+    draft.isEditable = true
+    host.addSubview(collapse)
+    host.addSubview(draft)
+
+    // AppKit receives hit-test points in the receiver's superview coordinates.
+    // Use the real controls' contract, with a translated anchor and host.
+    let draftPoint = parent.convert(CGPoint(x: 200, y: 40), from: draft)
+    let collapsePoint = parent.convert(CGPoint(x: 12, y: 12), from: collapse)
+    let editorPoint = parent.convert(CGPoint(x: 200, y: 100), from: anchor)
+    let statusPoint = parent.convert(CGPoint(x: 200, y: 685), from: anchor)
+
+    for _ in 0..<3 {
+      anchor.isDocked = true
+      XCTAssertTrue(anchor.hitTest(draftPoint) === draft)
+      XCTAssertTrue(anchor.hitTest(collapsePoint) === collapse)
+      XCTAssertNil(anchor.hitTest(editorPoint))
+      XCTAssertNil(anchor.hitTest(statusPoint))
+      anchor.isDocked = false
+      XCTAssertNil(anchor.hitTest(draftPoint))
+      XCTAssertNil(anchor.hitTest(collapsePoint))
+    }
   }
 
   func testNativePanelAllocationIsIndependentOfOwnerWindow() {
@@ -193,6 +335,36 @@ final class AskPanelHostTests: XCTestCase {
     fixture.controller.syncPresentation(presentation, contentSize: CGSize(width: 640, height: 480))
     XCTAssertTrue(fixture.isPresented)
     XCTAssertEqual(fixture.controller.presentation.preferredFloatSize, largeSize)
+  }
+
+  func testOwnerWindowCloseTearsDownControllerAndClearsReferences() {
+    let fixture = makeFixture()
+    defer { fixture.close() }
+
+    let owner = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+      styleMask: [.titled],
+      backing: .buffered,
+      defer: true
+    )
+    let anchor = AskDockAnchorView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
+    let hosting = NSView(frame: NSRect(x: 0, y: 374, width: 900, height: 300))
+    anchor.addSubview(hosting)
+    fixture.controller.dockAnchorView = anchor
+    fixture.controller.hostingView = hosting
+    fixture.controller.attachOwnerWindow(owner)
+
+    fixture.controller.onPresentationChange = { _ in }
+
+    fixture.controller.syncPresentation(
+      .expandedDefault, contentSize: CGSize(width: 900, height: 700))
+
+    NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: owner)
+
+    XCTAssertNil(fixture.controller.ownerWindow)
+    XCTAssertNil(fixture.controller.dockAnchorView)
+    XCTAssertNil(fixture.controller.hostingView)
+    XCTAssertNil(fixture.controller.onPresentationChange)
   }
 
   private func makeFixture() -> Fixture {

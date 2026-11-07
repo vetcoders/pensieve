@@ -10,14 +10,34 @@ import SwiftUI
 /// second session or restarting work.
 @MainActor
 final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
+  /// One owner for the entire application, including restored native tabs.
+  static let shared: AskPanelController = {
+    let threads: AskThreadStore
+    do {
+      threads = AskThreadStore(history: try AskHistoryStore())
+    } catch {
+      threads = AskThreadStore()
+      threads.reportHistoryError(error)
+    }
+    return AskPanelController(defaults: .standard, threads: threads)
+  }()
+  @Published private(set) var activeThreadID = UUID()
+  let threads: AskThreadStore
+  private let defaults: UserDefaults?
+  private var rememberedMode: AskPresentationMode = .docked
+  private var contentSize: CGSize = .zero
+  private var theme: PensieveTheme = .graphite
+
   weak var ownerWindow: NSWindow?
   private(set) var panel: NSPanel?
   weak var dockAnchorView: AskDockAnchorView?
 
-  var presentation: AskPresentationState {
+  @Published var presentation: AskPresentationState {
     didSet {
       if oldValue != presentation {
+        persistPresentation()
         onPresentationChange?(presentation)
+        if !isSyncing { syncPresentation(presentation, contentSize: contentSize) }
       }
     }
   }
@@ -31,6 +51,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   var hostingView: NSView?
   private var isSyncing = false
+  private var isOwnerClosed = false
+  private var hasPositionedPanel = false
   private var ownerCloseObserver: Any?
   private var ownerMiniaturizeObserver: Any?
   private var ownerDeminiaturizeObserver: Any?
@@ -38,19 +60,132 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   init(
     presentation: AskPresentationState = .expandedDefault,
+    defaults: UserDefaults? = nil,
+    threads: AskThreadStore? = nil,
     panelFactory: (@MainActor () -> NSPanel)? = nil,
     presentPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderFront(nil) },
     dismissPanel: @escaping @MainActor (NSPanel) -> Void = { $0.orderOut(nil) },
     panelIsVisible: @escaping @MainActor (NSPanel) -> Bool = { $0.isVisible },
     onPresentationChange: (@MainActor (AskPresentationState) -> Void)? = nil
   ) {
-    self.presentation = presentation
+    self.defaults = defaults
+    self.threads = threads ?? AskThreadStore()
+    var restored = presentation
+    if let defaults {
+      restored.isExpanded = defaults.object(forKey: "pensieve.ask.expanded") as? Bool ?? true
+      let height = defaults.double(forKey: "pensieve.ask.dockHeight")
+      if height > 0 { restored.preferredDockHeight = height }
+      rememberedMode =
+        AskPresentationMode(
+          rawValue:
+            defaults.string(forKey: "pensieve.ask.presentationMode") ?? "") ?? .docked
+      if rememberedMode == .hidden { rememberedMode = .docked }
+      restored.mode =
+        defaults.object(forKey: "pensieve.ask.visible") as? Bool == false
+        ? .hidden : rememberedMode
+    }
+    self.presentation = restored
     self.panelFactory = panelFactory ?? { AskPanelController.makeProductionPanelWindow() }
     self.presentPanel = presentPanel
     self.dismissPanel = dismissPanel
     self.panelIsVisible = panelIsVisible
     self.onPresentationChange = onPresentationChange
     super.init()
+    if let raw = defaults?.string(forKey: "pensieve.ask.activeThread"),
+      let id = UUID(uuidString: raw),
+      let record = self.threads.historyRecords.first(where: { $0.id == id })
+    {
+      self.threads.restore(record)
+      activeThreadID = id
+    }
+  }
+
+  @discardableResult
+  func ensureThread(context: AskContext) -> AskThread {
+    let thread = threads.thread(for: activeThreadID, context: context)
+    defaults?.set(thread.id.uuidString, forKey: "pensieve.ask.activeThread")
+    return thread
+  }
+
+  /// Context changes mint a thread; changing editor tabs never mutates it.
+  func newThread(context: AskContext) {
+    threads.existingThread(for: activeThreadID)?.cancel()
+    activateThread(threads.newThread(context: context).id)
+  }
+
+  func activateThread(_ id: UUID) {
+    if threads.existingThread(for: id) == nil,
+      let record = threads.historyRecords.first(where: { $0.id == id })
+    {
+      threads.restore(record)
+    }
+    guard threads.existingThread(for: id) != nil else { return }
+    if id != activeThreadID { threads.existingThread(for: activeThreadID)?.cancel() }
+    activeThreadID = id
+    defaults?.set(id.uuidString, forKey: "pensieve.ask.activeThread")
+  }
+
+  /// Both menu and AppKit quit paths must preserve the conversation before
+  /// document consent can retire any other unsaved work. A failed write vetoes
+  /// termination while the transcript and draft are still available in memory.
+  func prepareForTermination(
+    confirmUnsavedHistoryQuit: @MainActor (String) -> Bool = { _ in false },
+    resolveDocuments: @MainActor () -> NSApplication.TerminateReply
+  ) -> NSApplication.TerminateReply {
+    if !threads.cancelAll() {
+      let message = threads.historyError ?? "Ask history could not be saved."
+      guard confirmUnsavedHistoryQuit(message) else {
+        presentation.mode = .docked
+        return .terminateCancel
+      }
+    }
+    return resolveDocuments()
+  }
+
+  static func confirmQuitWithoutSavedHistory(_ message: String) -> Bool {
+    let alert = NSAlert()
+    alert.messageText = "Ask history could not be saved"
+    alert.informativeText =
+      message + "\nQuit without saving the latest Ask conversations and drafts?"
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Quit Without Saving Ask History")
+    return alert.runModal() == .alertSecondButtonReturn
+  }
+
+  var isVisible: Bool { presentation.mode != .hidden }
+
+  func setVisible(_ visible: Bool) {
+    presentation.mode = visible ? rememberedMode : .hidden
+  }
+
+  private func persistPresentation() {
+    if presentation.mode != .hidden { rememberedMode = presentation.mode }
+    guard let defaults else { return }
+    defaults.set(isVisible, forKey: "pensieve.ask.visible")
+    defaults.set(rememberedMode.rawValue, forKey: "pensieve.ask.presentationMode")
+    defaults.set(presentation.preferredDockHeight, forKey: "pensieve.ask.dockHeight")
+    defaults.set(presentation.isExpanded, forKey: "pensieve.ask.expanded")
+  }
+
+  /// Only the selected document root may reparent or update the shared host.
+  func activateHost(_ anchor: AskDockAnchorView, window: NSWindow?) {
+    if dockAnchorView !== anchor { dockAnchorView?.isDocked = false }
+    dockAnchorView = anchor
+    attachOwnerWindow(window)
+  }
+
+  func releaseHost(_ anchor: AskDockAnchorView) {
+    guard dockAnchorView === anchor else { return }
+    anchor.isDocked = false
+    hostingView?.removeFromSuperview()
+    dockAnchorView = nil
+    attachOwnerWindow(nil)
+    if let panel { dismissPanel(panel) }
+  }
+
+  func updateTheme(_ theme: PensieveTheme) {
+    self.theme = theme
+    if let panel { TaflaPanelChrome.applyTheme(theme, to: panel) }
   }
 
   isolated deinit {
@@ -95,6 +230,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
     self.ownerWindow = window
     guard let window else { return }
+    isOwnerClosed = false
+    hasPositionedPanel = false
 
     ownerCloseObserver = NotificationCenter.default.addObserver(
       forName: NSWindow.willCloseNotification,
@@ -130,9 +267,20 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
   }
 
   func handleOwnerWindowWillClose() {
+    isOwnerClosed = true
+    threads.flushHistory()
     if let panel {
       dismissPanel(panel)
     }
+    attachOwnerWindow(nil)
+    dockAnchorView = nil
+    hostingView?.removeFromSuperview()
+    hostingView = nil
+    onPresentationChange = nil
+  }
+
+  func teardown() {
+    handleOwnerWindowWillClose()
   }
 
   func windowWillClose(_ notification: Notification) {
@@ -171,8 +319,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   private func configurePanel(_ panel: NSPanel) {
     panel.title = "Ask"
-    panel.titleVisibility = .hidden
-    panel.titlebarAppearsTransparent = true
+    TaflaPanelChrome.configure(panel)
+    TaflaPanelChrome.applyTheme(theme, to: panel)
     panel.isFloatingPanel = true
     panel.level = presentation.isAlwaysOnTop ? .floating : .normal
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -197,10 +345,17 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
 
   func syncPresentation(_ targetPresentation: AskPresentationState, contentSize: CGSize) {
     guard !isSyncing else { return }
+    if isOwnerClosed {
+      if let panel, panelIsVisible(panel) {
+        dismissPanel(panel)
+      }
+      return
+    }
     isSyncing = true
     defer { isSyncing = false }
 
-    self.presentation = targetPresentation
+    self.contentSize = contentSize
+    if presentation != targetPresentation { self.presentation = targetPresentation }
 
     switch targetPresentation.mode {
     case .docked:
@@ -208,6 +363,8 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
         dismissPanel(panel)
       }
 
+      // Retire the old sizing writer before the same hosting view docks.
+      panel?.contentView = nil
       guard let dockAnchorView else { return }
       dockAnchorView.isDocked = true
 
@@ -249,10 +406,15 @@ final class AskPanelController: NSObject, NSWindowDelegate, ObservableObject {
         }
       }
 
+      let panelSize = targetPresentation.preferredFloatSize
+      if panel.contentView?.bounds.size != panelSize {
+        panel.setContentSize(panelSize)
+      }
+
       if !panelIsVisible(panel) {
-        if let ownerWindow, panel.frame.origin.x <= 0 && panel.frame.origin.y <= 0 {
+        if let ownerWindow, !hasPositionedPanel {
+          hasPositionedPanel = true
           let ownerFrame = ownerWindow.frame
-          let panelSize = targetPresentation.preferredFloatSize
           let initialOrigin = CGPoint(
             x: max(ownerFrame.maxX - panelSize.width - 24, 60),
             y: max(ownerFrame.minY + 60, 60)
@@ -286,16 +448,14 @@ final class AskDockAnchorView: NSView {
   var isDocked: Bool = false
 
   override func hitTest(_ point: NSPoint) -> NSView? {
-    guard isDocked, dockRect.contains(point) else {
+    // AppKit supplies the point in our superview's coordinates. The dock
+    // filter uses local coordinates; native descendants keep AppKit's normal
+    // hit-test traversal so their frame offsets are applied exactly once.
+    let localPoint = convert(point, from: superview)
+    guard isDocked, dockRect.contains(localPoint) else {
       return nil
     }
-    for subview in subviews.reversed() {
-      let subPoint = convert(point, to: subview)
-      if let hit = subview.hitTest(subPoint) {
-        return hit
-      }
-    }
-    return self
+    return super.hitTest(point)
   }
 }
 
@@ -305,29 +465,30 @@ struct AskPanelHostView<Content: View>: NSViewRepresentable {
   @Binding var presentation: AskPresentationState
   let contentSize: CGSize
   let hostWindow: NSWindow?
+  let isActive: Bool
+  let theme: PensieveTheme
   let content: () -> Content
+
+  final class Coordinator {
+    let controller: AskPanelController
+    init(controller: AskPanelController) { self.controller = controller }
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
 
   func makeNSView(context: Context) -> AskDockAnchorView {
     let anchor = AskDockAnchorView()
-    controller.dockAnchorView = anchor
-    controller.attachOwnerWindow(hostWindow)
-
-    if controller.hostingView == nil {
-      let hosting = NSHostingView(rootView: content())
-      hosting.sizingOptions = []
-      hosting.translatesAutoresizingMaskIntoConstraints = true
-      hosting.autoresizingMask = []
-      controller.hostingView = hosting
-    }
-
-    controller.syncPresentation(presentation, contentSize: contentSize)
+    updateNSView(anchor, context: context)
     return anchor
   }
 
   func updateNSView(_ anchor: AskDockAnchorView, context: Context) {
-    controller.dockAnchorView = anchor
-    controller.attachOwnerWindow(hostWindow)
-
+    guard isActive else {
+      controller.releaseHost(anchor)
+      anchor.isDocked = false
+      return
+    }
+    controller.activateHost(anchor, window: hostWindow)
     if let hosting = controller.hostingView as? NSHostingView<Content> {
       hosting.rootView = content()
     } else if controller.hostingView == nil {
@@ -337,7 +498,11 @@ struct AskPanelHostView<Content: View>: NSViewRepresentable {
       hosting.autoresizingMask = []
       controller.hostingView = hosting
     }
-
+    controller.updateTheme(theme)
     controller.syncPresentation(presentation, contentSize: contentSize)
+  }
+
+  static func dismantleNSView(_ anchor: AskDockAnchorView, coordinator: Coordinator) {
+    coordinator.controller.releaseHost(anchor)
   }
 }

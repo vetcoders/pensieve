@@ -317,6 +317,9 @@ struct AskTranscriptView: View {
   var onRevealEarlier: () -> Void = {}
   var onJumpToLatest: () -> Void = {}
   var onRevealTurn: (String) -> Void = { _ in }
+  var selectsMessages = false
+  var selectedMessageIDs: Set<String> = []
+  var onSelectMessage: (String, Bool) -> Void = { _, _ in }
 
   var body: some View {
     // Lazy inside the caller's scroll view. The snapshot is already a bounded
@@ -366,7 +369,28 @@ struct AskTranscriptView: View {
   @ViewBuilder
   private func turnBody(_ turn: AskTranscriptRenderedTurn) -> some View {
     VStack(alignment: .leading, spacing: 3) {
-      if !turn.roleLabel.isEmpty {
+      if selectsMessages {
+        Button {
+          onSelectMessage(turn.id, NSApp.currentEvent?.modifierFlags.contains(.shift) == true)
+        } label: {
+          HStack(spacing: 6) {
+            Image(
+              systemName: selectedMessageIDs.contains(turn.id) ? "checkmark.circle.fill" : "circle"
+            )
+            .foregroundStyle(Color(nsColor: tokens.accent.nsColor))
+            Text(turn.roleLabel.isEmpty ? "Message" : turn.roleLabel)
+              .foregroundStyle(Color(nsColor: tokens.muted.nsColor))
+            Spacer(minLength: 0)
+          }
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 10.5, weight: .medium))
+        .accessibilityLabel(
+          selectedMessageIDs.contains(turn.id) ? "Deselect message" : "Select message"
+        )
+        .accessibilityIdentifier("pensieve.ask.select.\(turn.id)")
+      } else if !turn.roleLabel.isEmpty {
         Text(turn.roleLabel)
           .font(.system(size: 10.5, weight: .medium))
           .foregroundStyle(Color(nsColor: tokens.muted.nsColor))

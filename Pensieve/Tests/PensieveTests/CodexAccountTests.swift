@@ -212,6 +212,7 @@ final class CodexAccountTests: XCTestCase {
       wire: "responses", endpoint: "https://api.openai.com/v1/responses",
       apiKeyAccount: "LLM_OPENAI_API_KEY", apiKeySet: false, keyRequired: true,
       accountSignedIn: signedIn, accountLoginEnabled: true, accountStatusMessage: status,
+      accountIdentity: nil,
       oauthClientId: "shipped-client-id")
   }
 
@@ -220,7 +221,8 @@ final class CodexAccountTests: XCTestCase {
       id: "xai-responses", kind: "vendor", displayName: "xAI (Grok)", wire: "responses",
       endpoint: "https://api.x.ai/v1/responses", apiKeyAccount: "LLM_XAI_API_KEY",
       apiKeySet: false, keyRequired: true, accountSignedIn: signedIn, accountLoginEnabled: true,
-      accountStatusMessage: signedIn ? "signed in" : "not signed in", oauthClientId: nil)
+      accountStatusMessage: signedIn ? "signed in" : "not signed in", accountIdentity: nil,
+      oauthClientId: nil)
   }
 
   nonisolated static func lane(_ providerID: String) -> CsRuntimeLlmLane {

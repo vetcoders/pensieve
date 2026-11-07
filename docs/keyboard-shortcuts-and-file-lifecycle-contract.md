@@ -370,6 +370,13 @@ Minimizes the active window. Must not open Settings/Preferences or trigger any o
 
 Opens the find bar and searches only in the active document. This is not workspace or global search and must not disappear through a `CommandGroup` override.
 
+`Aa` (Match Case) distinguishes uppercase and lowercase; `Word` (Whole Words)
+matches complete words rather than fragments inside a longer word or identifier.
+They are independent switches shared by Find, Replace and Replace All. Both
+default off and retain their choice while the document window stays open.
+Accents remain distinct, and replacement text is inserted literally.
+`Cmd+Option+F` opens the replacement row under the search row.
+
 ### `Shift+Cmd+F` — Search in Workspace
 
 Runs a search across the workspace via the index / FTS / fallback. Does not replace `Cmd+F`, and the results must reflect the current state of the files.
@@ -1078,3 +1085,20 @@ zoom `Cmd+±0`. **`Shift+Cmd+N` reserved** — nothing is assigned to it in v1.
 Settled behavior belongs in the normative sections above, not in this list.
 In particular, `Cmd+W` and Open Files, the last-tab launcher, system-window
 close, and the batch-close/Save All sequence are resolved contracts.
+
+### One application-owned Ask surface
+
+Pensieve owns one Ask conversation, draft and presentation across its native
+windows and tabs. Changing the active document updates the document context;
+it does not create another agent or cancel the current turn. Ask is exclusively
+docked above the active document's status bar, floating in one native panel, or
+hidden. Float/Dock reparents the same hosted surface. Hide retains the draft,
+attachments and conversation; Stop cancels a turn. Only the active eligible
+document/workspace root may host it. A background root cannot reopen the panel
+or overwrite its presentation. Ask visibility/mode preferences are read once by
+the application owner and written by it, rather than mirrored by every tab.
+
+Ask and Dictation use the current Pensieve theme for their glass, native
+appearance, text and controls. Their native traffic lights are hidden; the
+in-content close control is the single visible dismiss affordance. Native
+resizing and Ask's Always on Top toggle remain available.

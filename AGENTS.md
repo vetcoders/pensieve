@@ -176,8 +176,10 @@ in the sessions that could pop a panel.
 notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
 the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG
 it just built, then verifies it — so commit `docs/index.html` together with the
-release. Local lanes (`make release-local`, `make release-appstore`, any
-`--no-notarize` run) never touch or gate on the page: the repo deliberately
+release. Local lanes (`make release-local`, also with `NOTARIZE=true`,
+`make release-appstore`, any `--no-notarize` or `--no-publish` run) never touch
+or gate on the page, never create a GitHub release and never copy to the
+internal shelf: the repo deliberately
 keeps an unfilled placeholder between releases. A page that cannot carry this
 build's checksum (missing, unreadable, read-only, reshaped, or advertising
 another version) fails in pre-flight, before anything is built or published.

@@ -74,6 +74,11 @@ final class AskConversationModel: ObservableObject {
   private var epoch: UInt64 = 0
   private var scrollRequests = 0
   private var worker: Task<Void, Never>?
+  private var flushTasks: [String: Task<Void, Never>] = [:]
+
+  deinit {
+    for task in flushTasks.values { task.cancel() }
+  }
 
   init(
     clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -85,6 +90,15 @@ final class AskConversationModel: ObservableObject {
 
   func parseCount(for id: String) -> Int { parseInvocations[id] ?? 0 }
   func document(for id: String) -> AskMarkdownDocument? { documents[id] }
+
+  /// Export from current thread text, not a parsed/coalesced snapshot or its
+  /// oversized-message excerpt. Filtering preserves the conversation order.
+  func selectedMessages(for ids: Set<String>) -> [AskSelectedMessage] {
+    turns.compactMap { turn in
+      guard ids.contains(turn.id) else { return nil }
+      return AskSelectedMessage(id: turn.id, roleLabel: turn.roleLabel, text: turn.text)
+    }
+  }
   /// Total parsed documents currently retained (bounded by the budget).
   var retainedDocumentCount: Int { documents.count }
 
@@ -126,7 +140,7 @@ final class AskConversationModel: ObservableObject {
       seen.insert(id)
       let memory = observedRevisions[id]
       if memory?.text == turn.text, memory?.isStreaming == turn.isStreaming {
-        // Unchanged since the last observation. If a scope switch evicted it
+        // Unchanged since the last observation. If a thread change evicted it
         // from the visible list, put it back with its remembered revision —
         // the cached document still matches, so nothing reparses.
         if let memory, indexByID[id] == nil {
@@ -165,9 +179,10 @@ final class AskConversationModel: ObservableObject {
     }
     if structural {
       // The display list follows the thread's order; re-added turns
-      // (scope switch) and appends must not scramble it.
+      // (thread change) and appends must not scramble it.
       let positions = Dictionary(
-        uniqueKeysWithValues: newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) })
+        newTurns.enumerated().map { ($0.element.id.uuidString, $0.offset) },
+        uniquingKeysWith: { first, _ in first })
       turns.sort { (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max) }
     }
     // Eager parse is due only for the window the user can actually see.
@@ -184,20 +199,50 @@ final class AskConversationModel: ObservableObject {
     if turn.isStreaming {
       var scheduler = schedulers[turn.id] ?? AskMarkdownStreamScheduler()
       defer { schedulers[turn.id] = scheduler }
-      guard
-        let publication = scheduler.ingest(
-          text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
-      else { return false }
-      requestParse(id: turn.id, text: publication.text, revision: publication.generation)
-      noteContentChanged()
-      return true
+      if let publication = scheduler.ingest(
+        text: turn.text, generation: turn.revision, at: clock(), isFinal: false)
+      {
+        flushTasks[turn.id]?.cancel()
+        flushTasks.removeValue(forKey: turn.id)
+        requestParse(id: turn.id, text: publication.text, revision: publication.generation)
+        noteContentChanged()
+        return true
+      }
+      scheduleTrailingFlush(for: turn.id, generation: turn.revision)
+      return false
     }
+    flushTasks[turn.id]?.cancel()
+    flushTasks.removeValue(forKey: turn.id)
     schedulers.removeValue(forKey: turn.id)
     // A live turn going final is visible even mid-gesture; a historical
     // completed turn changes nothing on screen by itself.
     guard wasStreaming else { return false }
     noteContentChanged()
     return true
+  }
+
+  private func scheduleTrailingFlush(for id: String, generation: UInt64) {
+    flushTasks[id]?.cancel()
+    let currentEpoch = self.epoch
+    flushTasks[id] = Task { [weak self] in
+      try? await Task.sleep(for: .milliseconds(110))
+      guard !Task.isCancelled else { return }
+      await MainActor.run { [weak self] in
+        guard let self, self.epoch == currentEpoch else { return }
+        self.flushTrailingText(for: id, generation: generation)
+      }
+    }
+  }
+
+  private func flushTrailingText(for id: String, generation: UInt64) {
+    flushTasks.removeValue(forKey: id)
+    guard var scheduler = schedulers[id] else { return }
+    let now = clock()
+    guard let publication = scheduler.advance(to: now) else { return }
+    schedulers[id] = scheduler
+    requestParse(id: id, text: publication.text, revision: publication.generation)
+    noteContentChanged()
+    publish()
   }
 
   /// Eager parsing is bounded to the visible history window. Hidden turns
@@ -324,6 +369,8 @@ final class AskConversationModel: ObservableObject {
     window.reset()
     schedulers.removeAll()
     latestRequests.removeAll()
+    for task in flushTasks.values { task.cancel() }
+    flushTasks.removeAll()
     epoch &+= 1
     if follow.handle(.threadChanged) == .scrollToLiveEdge {
       scrollRequests += 1
@@ -474,55 +521,134 @@ struct AskConversationTranscript: View {
   /// the code/table viewports always see real geometry.
   static let horizontalPadding: CGFloat = 12
   @State private var scrollIntent = AskScrollIntentRouter()
+  @State private var selection = AskMessageSelection()
+  @State private var copyTask: Task<Void, Never>?
+  @State private var isCopying = false
+  @State private var copyError: String?
 
   var body: some View {
     GeometryReader { outer in
-      ScrollViewReader { proxy in
-        ScrollView {
-          VStack(alignment: .leading, spacing: 6) {
-            AskTranscriptView(
-              snapshot: model.snapshot,
-              tokens: themeManager.skin.tokens,
-              containerWidth: max(0, outer.size.width - Self.horizontalPadding * 2),
-              revealedTurnIDs: model.revealedTurnIDs,
-              onRevealEarlier: { model.revealEarlier() },
-              onJumpToLatest: { model.jumpToLatest() },
-              onRevealTurn: { id in model.revealTurn(id) }
-            )
-            footer
-            Color.clear
-              .frame(height: 1)
-              .id(liveEdgeID)
+      VStack(spacing: 4) {
+        selectionToolbar
+        ScrollViewReader { proxy in
+          ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+              AskTranscriptView(
+                snapshot: model.snapshot,
+                tokens: themeManager.skin.tokens,
+                containerWidth: max(0, outer.size.width - Self.horizontalPadding * 2),
+                revealedTurnIDs: model.revealedTurnIDs,
+                onRevealEarlier: { model.revealEarlier() },
+                onJumpToLatest: { model.jumpToLatest() },
+                onRevealTurn: { id in model.revealTurn(id) },
+                selectsMessages: selection.isActive,
+                selectedMessageIDs: selection.ids,
+                onSelectMessage: { id, extending in
+                  selection.toggle(id, in: model.snapshot.turns.map(\.id), extending: extending)
+                }
+              )
+              footer
+              Color.clear
+                .frame(height: 1)
+                .id(liveEdgeID)
+            }
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.vertical, 4)
           }
-          .padding(.horizontal, Self.horizontalPadding)
-          .padding(.vertical, 4)
-        }
-        .onChange(of: model.snapshot.scrollRequests) { _, _ in
-          proxy.scrollTo(liveEdgeID, anchor: .bottom)
-        }
-        .onScrollGeometryChange(
-          for: Bool.self,
-          of: { geometry in
-            StreamScrollFollowState.followTailAfterScroll(
-              contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
-              viewportHeight: geometry.containerSize.height)
-          },
-          action: { _, isAtLiveEdge in
-            // Geometry alone is not user intent: programmatic scrolls, content
-            // growth and resize only inform the router's position memory.
-            for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+          .onChange(of: model.snapshot.scrollRequests) { _, _ in
+            proxy.scrollTo(liveEdgeID, anchor: .bottom)
+          }
+          .onScrollGeometryChange(
+            for: Bool.self,
+            of: { geometry in
+              StreamScrollFollowState.followTailAfterScroll(
+                contentBottom: geometry.contentSize.height - geometry.contentOffset.y,
+                viewportHeight: geometry.containerSize.height)
+            },
+            action: { _, isAtLiveEdge in
+              // Geometry alone is not user intent: programmatic scrolls, content
+              // growth and resize only inform the router's position memory.
+              for intent in scrollIntent.geometryChanged(isAtLiveEdge: isAtLiveEdge) {
+                apply(intent)
+              }
+            }
+          )
+          .onScrollPhaseChange { _, phase in
+            for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
               apply(intent)
             }
-          }
-        )
-        .onScrollPhaseChange { _, phase in
-          for intent in scrollIntent.phaseChanged(to: AskScrollPhase(phase)) {
-            apply(intent)
           }
         }
       }
     }
+    .onChange(of: model.snapshot.turns.map(\.id)) { _, _ in
+      guard selection.isActive else { return }
+      selection.retain(Set(model.selectedMessages(for: selection.ids).map(\.id)))
+    }
+    .onDisappear {
+      copyTask?.cancel()
+      copyTask = nil
+      isCopying = false
+    }
     .accessibilityIdentifier("\(identifierPrefix).turns")
+  }
+
+  private var selectionToolbar: some View {
+    HStack(spacing: 12) {
+      if selection.isActive {
+        Button(isCopying ? "Copying…" : "Copy selected · \(selection.ids.count)") {
+          copySelectedMessages()
+        }
+        .disabled(selection.ids.isEmpty || isCopying)
+        .accessibilityIdentifier("\(identifierPrefix).copySelected")
+        Text("Shift-click to select a range")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer(minLength: 0)
+        Button("Done") {
+          copyTask?.cancel()
+          copyTask = nil
+          isCopying = false
+          copyError = nil
+          selection.end()
+        }
+        .accessibilityIdentifier("\(identifierPrefix).selectionDone")
+      } else {
+        Spacer(minLength: 0)
+        Button {
+          selection.begin()
+          // Streaming must not move the messages the user is selecting.
+          model.userScrollBegan()
+        } label: {
+          Label("Select messages", systemImage: "checkmark.circle")
+        }
+        .accessibilityIdentifier("\(identifierPrefix).selectMessages")
+      }
+    }
+    .buttonStyle(.plain)
+    .font(.system(size: 11, weight: .medium))
+    .padding(.horizontal, Self.horizontalPadding)
+    .padding(.top, 2)
+  }
+
+  private func copySelectedMessages() {
+    let messages = model.selectedMessages(for: selection.ids)
+    guard !messages.isEmpty, !isCopying else { return }
+    let pasteboard = NSPasteboard.general
+    let changeCount = pasteboard.changeCount
+    isCopying = true
+    copyError = nil
+    copyTask = Task { @MainActor in
+      let text = await Task.detached(priority: .userInitiated) {
+        AskMessageCopy.source(messages)
+      }.value
+      guard !Task.isCancelled else { return }
+      if !AskMessageCopy.write(text, to: pasteboard, expecting: changeCount) {
+        copyError = "Clipboard changed. Copy the selected messages again."
+      }
+      isCopying = false
+      copyTask = nil
+    }
   }
 
   private func apply(_ intent: AskScrollIntent) {
@@ -536,6 +662,12 @@ struct AskConversationTranscript: View {
 
   @ViewBuilder
   private var footer: some View {
+    if let copyError {
+      Text(copyError)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("\(identifierPrefix).copyError")
+    }
     if let error {
       Text(error)
         .font(.system(size: 10.5))
@@ -696,10 +828,6 @@ struct AskConversationComposer: View {
 /// two competing headers. All three read the same account truth as the
 /// status bar and Settings ▸ AI.
 struct AskProviderHeader: View {
-  var showsScopePicker: Bool
-  @Binding var workspaceSelected: Bool
-  var documentScopeEnabled: Bool
-  var workspaceScopeEnabled: Bool
   @ObservedObject var grokAccount: GrokAccount
   @ObservedObject var codexAccount: CodexAccount
   var apiKey: String
@@ -720,38 +848,8 @@ struct AskProviderHeader: View {
   }
 
   var body: some View {
-    if showsScopePicker {
-      HStack(spacing: 4) {
-        Button {
-          workspaceSelected = false
-        } label: {
-          scopeLabel("Document", symbol: "doc.text")
-        }
-        .accessibilityLabel("Document")
-        .disabled(!workspaceSelected || !documentScopeEnabled)
-        Button {
-          workspaceSelected = true
-        } label: {
-          scopeLabel("Workspace", symbol: "folder")
-        }
-        .accessibilityLabel("Workspace")
-        .disabled(workspaceSelected || !workspaceScopeEnabled)
-      }
-      .controlSize(.small)
-      .fixedSize()
-      .accessibilityIdentifier("pensieve.ask.scope")
-    }
     providerMenu
     readinessChip
-  }
-
-  @ViewBuilder
-  private func scopeLabel(_ title: String, symbol: String) -> some View {
-    if compact {
-      Image(systemName: symbol).frame(width: 22, height: 16)
-    } else {
-      Text(title).fixedSize()
-    }
   }
 
   private var providerMenu: some View {

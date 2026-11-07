@@ -504,7 +504,7 @@ final class GrokAccountTests: XCTestCase {
       endpoint: "https://api.x.ai/v1/responses", apiKeyAccount: "LLM_XAI_API_KEY",
       apiKeySet: false, keyRequired: true, accountSignedIn: signedIn,
       accountLoginEnabled: true,
-      accountStatusMessage: status, oauthClientId: "shipped-client-id")
+      accountStatusMessage: status, accountIdentity: nil, oauthClientId: "shipped-client-id")
   }
 
   nonisolated static func openAIRow() -> CsProviderOption {
@@ -512,7 +512,7 @@ final class GrokAccountTests: XCTestCase {
       id: "openai-responses", kind: "vendor", displayName: "OpenAI", wire: "responses",
       endpoint: "https://api.openai.com/v1/responses", apiKeyAccount: "LLM_OPENAI_API_KEY",
       apiKeySet: true, keyRequired: true, accountSignedIn: false, accountLoginEnabled: true,
-      accountStatusMessage: "not signed in", oauthClientId: nil)
+      accountStatusMessage: "not signed in", accountIdentity: nil, oauthClientId: nil)
   }
 
   nonisolated static func lane(_ providerID: String) -> CsRuntimeLlmLane {

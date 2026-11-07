@@ -1,57 +1,27 @@
-import CodescribeBridge
 import SwiftUI
 
-/// Slot extraction must happen inside a mounted observer's body. Reading a
-/// computed slot on an unmounted View does not install its @ObservedObject.
-struct AskDocumentThreadObservation<Content: View>: View {
-  @ObservedObject var thread: DocumentAskThread
-  @ViewBuilder var content: (DocumentAskThread) -> Content
-
+/// Slot reads happen inside a mounted Observation tracking body.
+struct AskThreadObservation<Content: View>: View {
+  var thread: AskThread
+  @ViewBuilder var content: (AskThread) -> Content
   var body: some View { content(thread) }
 }
 
-/// Document-scope Ask: a thin wrapper that binds the document thread to the
-/// ONE shared conversation UI. Session authority stays in `DocumentAskThread`;
-/// this view only supplies bindings and callbacks to the assembled surface,
-/// so document and workspace Ask render the same transcript, input and chips.
+/// One composer for every immutable thread context.
 struct AskComposerView: View {
-  @ObservedObject var thread: DocumentAskThread
-  /// Grok's account and Ask routing, read from Pensieve’s embedded engine and shared
-  /// with Settings ▸ AI.
-  @ObservedObject var grokAccount: GrokAccount
-  @ObservedObject var codexAccount: CodexAccount
-  let apiKey: String
-  let makeDocumentHost: @MainActor () -> DocumentToolHost
-  let apiConfiguration: CsDocumentProvider
-  /// The shared off-main transcript model, owned by the surface host so the
-  /// parse cache survives scope and presentation switches.
+  @Bindable var thread: AskThread
   @ObservedObject var conversation: AskConversationModel
-  var openProviderSettings: @MainActor () -> Void = {
-    _ = PensieveSettingsWindowController.shared.show(section: .ai)
-  }
+  let provider: AskProvider
+  let readinessContext: AskEndpointContext?
+  var providerError: String? = nil
+  var historyError: String? = nil
+  var onSubmit: @MainActor (String) async -> Bool
 
-  static let placeholder = "Ask or edit this document"
-  static let accessibilityPrefix = "pensieve.ask"
+  nonisolated static let placeholder = "Ask a question"
+  nonisolated static let accessibilityPrefix = "pensieve.ask"
+  nonisolated static let fieldAccessibilityIdentifier = "pensieve.ask.draft"
+  nonisolated static let submitAccessibilityIdentifier = "pensieve.ask.send"
 
-  var provider: AskProvider {
-    if grokAccount.snapshot.askUsesGrok {
-      return grokAccount.snapshot.askProvider(apiKey: apiKey)
-    }
-    return codexAccount.snapshot.askProvider(apiKey: apiKey)
-  }
-
-  private var usesAccountProvider: Bool {
-    grokAccount.snapshot.askUsesGrok || codexAccount.snapshot.askUsesCodex
-  }
-
-  /// The endpoint/model an API-key send is configured with. Account lanes
-  /// carry their own credentials, so the loopback rule never applies to them.
-  var readinessContext: AskEndpointContext? {
-    usesAccountProvider ? nil : AskEndpointContext(configuration: apiConfiguration)
-  }
-
-  /// Standalone rendering stacks both slots; the assembled surface mounts
-  /// them separately.
   var body: some View {
     VStack(spacing: 0) {
       transcript
@@ -59,48 +29,43 @@ struct AskComposerView: View {
     }
   }
 
-  /// The transcript slot the surface mounts. Observing the thread here (not
-  /// in the model) keeps streaming updates flowing into the coalescer.
   var transcript: some View {
     AskConversationTranscript(
       model: conversation,
-      error: thread.isStreaming ? nil : thread.lastError,
-      providerError: grokAccount.lastError ?? codexAccount.lastError,
-      activity: thread.isStreaming ? thread.activity : nil,
+      error: thread.isBusy ? historyError : (thread.lastError ?? historyError),
+      providerError: providerError,
+      activity: thread.isPreparing ? "Preparing context…" : thread.activity,
       identifierPrefix: Self.accessibilityPrefix
     )
     .onAppear { conversation.observe(turns: thread.turns) }
     .onChange(of: thread.turns) { _, turns in conversation.observe(turns: turns) }
   }
 
-  /// The composer slot the surface mounts.
   var composer: some View {
     AskConversationComposer(
       store: thread.attachmentStore,
       draft: $thread.draft,
-      isBusy: thread.isStreaming,
-      canSend: canSend,
+      isBusy: thread.isBusy,
+      canSend: Self.submission(from: thread.draft) != nil && !thread.isBusy
+        && AskReadiness.isReady(provider, context: readinessContext),
       placeholder: Self.placeholder,
       identifierPrefix: Self.accessibilityPrefix,
-      draftAccessibilityIdentifier: "pensieve.ask.draft",
-      submitAccessibilityIdentifier: "pensieve.ask.send",
-      onSend: send,
+      draftAccessibilityIdentifier: Self.fieldAccessibilityIdentifier,
+      submitAccessibilityIdentifier: Self.submitAccessibilityIdentifier,
+      onSend: submit,
       onStop: { thread.cancel() }
     )
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("pensieve.ask.composer")
   }
 
-  private var canSend: Bool {
-    !thread.isStreaming
-      && !thread.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      && AskReadiness.isReady(provider, context: readinessContext)
+  private func submit() {
+    guard let text = Self.submission(from: thread.draft), !thread.isBusy else { return }
+    Task { _ = await onSubmit(text) }
   }
 
-  private func send() {
-    guard !thread.isStreaming else { return }
-    _ = thread.send(
-      provider: provider, host: makeDocumentHost(),
-      configuration: usesAccountProvider ? nil : apiConfiguration)
+  nonisolated static func submission(from draft: String) -> String? {
+    let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 }

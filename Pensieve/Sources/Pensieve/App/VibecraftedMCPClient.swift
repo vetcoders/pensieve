@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Synchronization
 
@@ -147,19 +148,20 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: commandPath)
     process.arguments = ["--version"]
-    process.standardOutput = Pipe()
-    process.standardError = Pipe()
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
     do {
       try process.run()
     } catch {
       return .unreachable
     }
-    let deadline = Date().addingTimeInterval(versionProbeTimeout)
-    while process.isRunning, Date() < deadline {
+    defer { MCPStdioConnection.stop(process) }
+    let deadline = ProcessInfo.processInfo.systemUptime + versionProbeTimeout
+    while process.isRunning, ProcessInfo.processInfo.systemUptime < deadline {
       Thread.sleep(forTimeInterval: 0.05)
     }
     if process.isRunning {
-      process.terminate()
       return .unreachable
     }
     return process.terminationStatus == 0 ? .connected : .unreachable
@@ -173,19 +175,10 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
     guard FileManager.default.isExecutableFile(atPath: commandPath) else {
       throw AgentPromptLauncherError.mcpNotReady(.unreachable)
     }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: commandPath)
-    let stdin = Pipe()
-    let stdout = Pipe()
-    process.standardInput = stdin
-    process.standardOutput = stdout
-    process.standardError = Pipe()
-    try process.run()
-    defer {
-      if process.isRunning { process.terminate() }
-    }
+    let connection = try MCPStdioConnection(commandPath: commandPath, timeout: toolCallTimeout)
+    defer { connection.close() }
 
-    try writeMCPMessage(
+    try connection.write(
       [
         "jsonrpc": "2.0",
         "id": 1,
@@ -195,19 +188,19 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
           "capabilities": [:] as [String: String],
           "clientInfo": ["name": "pensieve", "version": "w6-01"],
         ],
-      ],
-      to: stdin.fileHandleForWriting)
-    _ = try readMCPMessage(
-      from: stdout.fileHandleForReading, timeout: toolCallTimeout)
+      ])
+    let initialization = try connection.readResponse(id: 1)
+    guard initialization["error"] == nil else {
+      throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+    }
 
-    try writeMCPMessage(
+    try connection.write(
       [
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
-      ],
-      to: stdin.fileHandleForWriting)
+      ])
 
-    try writeMCPMessage(
+    try connection.write(
       [
         "jsonrpc": "2.0",
         "id": 2,
@@ -216,81 +209,9 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
           "name": name,
           "arguments": arguments,
         ],
-      ],
-      to: stdin.fileHandleForWriting)
-    let response = try readMCPMessage(
-      from: stdout.fileHandleForReading, timeout: toolCallTimeout)
-    try? stdin.fileHandleForWriting.close()
-    if process.isRunning {
-      process.terminate()
-      process.waitUntilExit()
-    }
+      ])
+    let response = try connection.readResponse(id: 2)
     return Self.toolPayload(from: response)
-  }
-
-  private func writeMCPMessage(
-    _ object: [String: Any],
-    to handle: FileHandle
-  ) throws {
-    let data = try JSONSerialization.data(withJSONObject: object)
-    let header = "Content-Length: \(data.count)\r\n\r\n"
-    var payload = Data(header.utf8)
-    payload.append(data)
-    try handle.write(contentsOf: payload)
-  }
-
-  private func readMCPMessage(
-    from handle: FileHandle,
-    timeout: TimeInterval
-  ) throws -> [String: Any] {
-    let deadline = Date().addingTimeInterval(timeout)
-    var buffer = Data()
-    while Date() < deadline {
-      let next = handle.availableData
-      if !next.isEmpty {
-        buffer.append(next)
-      }
-      if let message = Self.parseFramedJSON(from: &buffer) {
-        return message
-      }
-      Thread.sleep(forTimeInterval: 0.05)
-    }
-    throw AgentPromptLauncherError.mcpNotReady(.unreachable)
-  }
-
-  private static func parseFramedJSON(from buffer: inout Data) -> [String: Any]? {
-    guard let text = String(data: buffer, encoding: .utf8) else { return nil }
-    let headerSeparator = "\r\n\r\n"
-    guard let separator = text.range(of: headerSeparator) else { return nil }
-    let header = String(text[text.startIndex..<separator.lowerBound])
-    var length: Int?
-    for line in header.split(whereSeparator: \.isNewline) {
-      let parts = line.split(separator: ":", maxSplits: 1)
-      if parts.count == 2,
-        parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
-          .lowercased() == "content-length",
-        let value = Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
-      {
-        length = value
-      }
-    }
-    guard let length else { return nil }
-    let bodyStart = separator.upperBound
-    let bodyUTF8 = Data(text[bodyStart...].utf8)
-    guard bodyUTF8.count >= length else { return nil }
-    let body = bodyUTF8.prefix(length)
-    guard
-      let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-    else {
-      return nil
-    }
-    let consumed = Data(text[text.startIndex..<separator.upperBound].utf8).count + length
-    if consumed <= buffer.count {
-      buffer.removeSubrange(0..<consumed)
-    } else {
-      buffer.removeAll()
-    }
-    return object
   }
 
   private static func toolPayload(from response: [String: Any]) -> [String: Any] {
@@ -313,6 +234,182 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
       }
     }
     return result
+  }
+}
+
+/// One bounded stdio exchange. Nonblocking descriptors make the deadline apply
+/// to silent/partial stdout AND a server that stops consuming stdin. Keep the
+/// buffer across responses: one read can contain notifications and both replies.
+private final class MCPStdioConnection {
+  private static let messageLimit = 8 * 1024 * 1024
+  private let process = Process()
+  private let input = Pipe()
+  private let output = Pipe()
+  private let deadline: TimeInterval
+  private var buffer = Data()
+
+  init(commandPath: String, timeout: TimeInterval) throws {
+    deadline = ProcessInfo.processInfo.systemUptime + timeout
+    process.executableURL = URL(fileURLWithPath: commandPath)
+    process.standardInput = input
+    process.standardOutput = output
+    // MCP permits ignoring diagnostics. An unread stderr pipe can fill and
+    // deadlock a server before it can answer initialize.
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    try? input.fileHandleForReading.close()
+    try? output.fileHandleForWriting.close()
+    do {
+      for handle in [input.fileHandleForWriting, output.fileHandleForReading] {
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+          throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+        }
+      }
+      // A peer may close stdin between poll and write. EPIPE must become a
+      // visible dispatch refusal, never a SIGPIPE crash of the editor.
+      guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+        throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+      }
+    } catch {
+      close()
+      throw error
+    }
+  }
+
+  func close() {
+    try? input.fileHandleForWriting.close()
+    try? output.fileHandleForReading.close()
+    Self.stop(process)
+  }
+
+  static func stop(_ process: Process) {
+    guard process.isRunning else { return }
+    process.terminate()
+    let deadline = ProcessInfo.processInfo.systemUptime + 0.2
+    while process.isRunning, ProcessInfo.processInfo.systemUptime < deadline {
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    if process.isRunning {
+      // Only the Process created for this exchange is ours. Do not wait without
+      // a bound (a server may ignore TERM or a descendant may retain the pipe).
+      _ = Darwin.kill(process.processIdentifier, SIGKILL)
+    }
+  }
+
+  func write(_ object: [String: Any]) throws {
+    var data = try JSONSerialization.data(withJSONObject: object)
+    data.append(0x0a)  // MCP stdio uses newline-delimited JSON, not LSP headers.
+    guard data.count <= Self.messageLimit else {
+      throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+    }
+    let descriptor = input.fileHandleForWriting.fileDescriptor
+    try data.withUnsafeBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        try wait(descriptor, events: Int16(POLLOUT))
+        let count = Darwin.write(
+          descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+        if count > 0 {
+          offset += count
+        } else if count < 0, errno == EINTR || errno == EAGAIN {
+          continue
+        } else {
+          throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+        }
+      }
+    }
+  }
+
+  func readResponse(id: Int) throws -> [String: Any] {
+    let descriptor = output.fileHandleForReading.fileDescriptor
+    while ProcessInfo.processInfo.systemUptime < deadline {
+      while let message = try nextMessage() {
+        guard message["jsonrpc"] as? String == "2.0" else {
+          throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+        }
+        // Notifications and unrelated replies never satisfy our request.
+        if message["method"] == nil,
+          let responseID = message["id"] as? NSNumber,
+          CFGetTypeID(responseID) != CFBooleanGetTypeID(),
+          responseID == NSNumber(value: id),
+          message["result"] != nil || message["error"] != nil
+        {
+          return message
+        }
+      }
+      try wait(descriptor, events: Int16(POLLIN))
+      var bytes = [UInt8](repeating: 0, count: 16 * 1024)
+      let count = Darwin.read(descriptor, &bytes, bytes.count)
+      if count > 0 {
+        buffer.append(contentsOf: bytes.prefix(count))
+        guard buffer.count <= Self.messageLimit else {
+          throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+        }
+      } else if count < 0, errno == EINTR || errno == EAGAIN {
+        continue
+      } else {
+        // EOF, including an incomplete final frame, is a failure immediately.
+        throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+      }
+    }
+    throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+  }
+
+  private func wait(_ descriptor: Int32, events: Int16) throws {
+    while true {
+      let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      guard remaining > 0 else {
+        throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+      }
+      var descriptorState = pollfd(fd: descriptor, events: events, revents: 0)
+      let milliseconds = Int32(min(remaining * 1000 + 1, 1000))
+      let result = Darwin.poll(&descriptorState, 1, milliseconds)
+      if result > 0 {
+        guard descriptorState.revents & Int16(POLLNVAL) == 0 else {
+          throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+        }
+        return  // HUP/ERR also reach read/write to report EOF/EPIPE.
+      }
+      if result < 0, errno != EINTR {
+        throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+      }
+    }
+  }
+
+  private func nextMessage() throws -> [String: Any]? {
+    guard let newline = buffer.firstIndex(of: 0x0a) else { return nil }
+    let firstLine = buffer[..<newline]
+    let body: Data
+    let consumed: Int
+    if String(decoding: firstLine, as: UTF8.self).lowercased().hasPrefix("content-length:") {
+      // Accept responses from older framed servers, byte-for-byte; decoding an
+      // incomplete UTF-8 body first would lose a split multibyte character.
+      guard let separator = buffer.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+      let header = String(decoding: buffer[..<separator.lowerBound], as: UTF8.self)
+      let lengthText = header.split(whereSeparator: \.isNewline).first?
+        .split(separator: ":", maxSplits: 1).last?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let lengthText, let length = Int(lengthText), length > 0,
+        length <= Self.messageLimit
+      else {
+        throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+      }
+      let bodyStart = separator.upperBound
+      guard buffer.count - bodyStart >= length else { return nil }
+      body = Data(buffer[bodyStart..<(bodyStart + length)])
+      consumed = bodyStart + length
+    } else {
+      body = Data(firstLine)
+      consumed = newline + 1
+    }
+    guard let message = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+      throw AgentPromptLauncherError.mcpNotReady(.unreachable)
+    }
+    // subdata rebases indices before the next frame's byte arithmetic.
+    buffer = buffer.subdata(in: consumed..<buffer.count)
+    return message
   }
 }
 

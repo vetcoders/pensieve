@@ -174,7 +174,7 @@ struct EditorStatusBar: View {
   /// hidden and its thread is mid-stream, the chip carries the activity dot —
   /// an in-flight Ask is never invisible.
   private var askToggleChip: some View {
-    AskToggleChip(threadID: appState.documentSession.askThreadID)
+    AskToggleChip()
   }
 }
 
@@ -183,12 +183,12 @@ struct EditorStatusBar: View {
 /// only asked for a NON-minting lookup so a document never opened for Ask does
 /// not birth an empty thread just by being displayed.
 private struct AskToggleChip: View {
-  @EnvironmentObject private var askThreads: DocumentAskThreadStore
-  @AppStorage("pensieve.ask.visible") private var askVisible = true
-  let threadID: UUID
+  @EnvironmentObject private var askThreads: AskThreadStore
+  @EnvironmentObject private var askPanelController: AskPanelController
+  private var askVisible: Bool { askPanelController.isVisible }
 
   var body: some View {
-    if let thread = askThreads.existingThread(for: threadID) {
+    if let thread = askThreads.existingThread(for: askPanelController.activeThreadID) {
       button(isStreaming: thread.isStreaming, hasTurns: !thread.turns.isEmpty)
     } else {
       button(isStreaming: false, hasTurns: false)
@@ -197,7 +197,7 @@ private struct AskToggleChip: View {
 
   private func button(isStreaming: Bool, hasTurns: Bool) -> some View {
     Button {
-      askVisible.toggle()
+      askPanelController.setVisible(!askVisible)
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "bubble.left.and.bubble.right")

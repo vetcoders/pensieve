@@ -31,19 +31,19 @@ final class AskInteractionTests: XCTestCase {
     rig.appState.documentSession = .untitled()
     rig.appState.documentSession.text = "# An open document"
     rig.settle(0.3)
-    let thread = rig.askThreads.thread(for: rig.appState.documentSession.askThreadID)
+    let thread = rig.askThreads.thread(for: rig.askPanelController.activeThreadID)
     thread.draft = "Explain the document"
     thread.appendDictation("Explain the document")
     rig.settle(0.3)
     let expandedHeight = try XCTUnwrap(rig.editorPaneHeight())
     assertStatusSpace(rig)
     for _ in 0..<3 {
-      defaults.set(false, forKey: "pensieve.ask.visible")
+      rig.askPanelController.setVisible(false)
       rig.settle(0.3)
       let hiddenHeight = try XCTUnwrap(rig.editorPaneHeight())
       XCTAssertGreaterThan(hiddenHeight, expandedHeight)
       assertStatusSpace(rig)
-      defaults.set(true, forKey: "pensieve.ask.visible")
+      rig.askPanelController.setVisible(true)
       rig.settle(0.3)
       XCTAssertEqual(try XCTUnwrap(rig.editorPaneHeight()), expandedHeight, accuracy: 1)
       assertStatusSpace(rig)
@@ -59,7 +59,7 @@ final class AskInteractionTests: XCTestCase {
     rig.appState.documentSession = .untitled()
     rig.appState.documentSession.text = "# Document"
     rig.settle(0.3)
-    let thread = rig.askThreads.thread(for: rig.appState.documentSession.askThreadID)
+    let thread = rig.askThreads.thread(for: rig.askPanelController.activeThreadID)
     thread.draft = "Explain"
     thread.appendDictation("Explain")
     rig.settle(0.3)
@@ -98,7 +98,7 @@ final class AskInteractionTests: XCTestCase {
       rig.appState.mode = mode
       rig.settle(0.3)
       for visible in [false, true, false] {
-        defaults.set(visible, forKey: "pensieve.ask.visible")
+        rig.askPanelController.setVisible(visible)
         rig.settle(0.3)
         XCTAssertEqual(rig.appState.workspaceTree, [node])
         let search = try XCTUnwrap(findSearch(in: rig.hosting))

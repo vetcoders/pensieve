@@ -146,6 +146,7 @@ final class DocumentWindowModel {
   var findBarVisible: Bool = false
   var findReplaceMode: Bool = false
   var findQuery: String = ""
+  var findOptions = DocumentFindOptions()
   var findReplaceQuery: String = ""
   var findFocusToken: Int = 0
   var pendingFindCommand: FindBarCommand?

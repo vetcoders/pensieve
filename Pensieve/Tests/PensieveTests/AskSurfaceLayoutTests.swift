@@ -7,6 +7,19 @@ final class AskSurfaceLayoutTests: XCTestCase {
   private let reference = CGSize(width: 900, height: 700)
   private let minimum = CGSize(width: 640, height: 480)
 
+  func testHostedDockUsesItsEntireReservedBandOnce() {
+    let state = AskPresentationState.expandedDefault
+    let window = AskSurfaceLayout.allocate(content: reference, presentation: state)
+    let hosted = AskSurfaceLayout.allocateHosted(
+      content: window.askRegion.size, presentation: state)
+    XCTAssertEqual(hosted.askRegion.size, window.askRegion.size)
+    XCTAssertEqual(hosted.transcript.height, window.transcript.height, accuracy: 0.01)
+    XCTAssertGreaterThanOrEqual(hosted.transcript.height, 240)
+    XCTAssertEqual(hosted.status, .zero)
+    XCTAssertEqual(hosted.editor, .zero)
+    XCTAssertEqual(hosted.composer.maxY, window.askRegion.height, accuracy: 0.01)
+  }
+
   func testNarrowFloatReservesTwoHeaderRowsAndKeepsComposerInsideShell() {
     for width: CGFloat in [320, 420, 520] {
       var state = AskPresentationState.expandedDefault
