@@ -39,7 +39,7 @@
         "applicationCategory": "Productivity",
         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "downloadUrl": "https://github.com/vetcoders/pensieve/releases/latest/download/Pensieve.dmg",
-        "softwareVersion": "0.7.0",
+        "softwareVersion": "0.6.0",
         "author": { "@type": "Organization", "name": "Vetcoders", "url": "https://github.com/vetcoders" },
         "description": "Markdown editor for macOS: live preview, workspace search, backlinks, a table formatter, reading themes, Word DOCX export, and DOCX/PDF import back to Markdown."
       }
@@ -551,6 +551,11 @@
       font-size: 0.97rem;
     }
 
+    .github-release-notes {
+      white-space: pre-line;
+      margin-top: 12px;
+    }
+
     /* ── Download band ────────────────────────────────────── */
     .download-band {
       background: #121513;
@@ -785,7 +790,7 @@
           <a class="btn btn-secondary" href="https://github.com/vetcoders/pensieve/releases/latest">Release notes</a>
         </div>
         <p class="release-note">
-          Version <code>0.7.0</code> · macOS 15+ · Apple silicon
+          Version <code id="hero-version">0.6.0</code> · macOS 15+ · Apple silicon
         </p>
       </div>
 
@@ -859,28 +864,30 @@
     <section class="whatsnew" id="whatsnew">
       <div class="section-inner">
         <div class="reveal">
-          <div class="section-label">Release 0.7.0</div>
+          <div class="section-label" id="release-label">Release 0.6.0</div>
           <h2>What’s new.</h2>
+          <p class="section-copy github-release-notes" id="github-release-notes">Notarized Developer ID build 0.6.0+44f395c2.
+
+SHA-256: 0f1c997a3afe19b51ec9e752e446082482c2816c8ee944a039d9873ad16e5706</p>
         </div>
-        <div class="new-grid">
+        <div class="new-grid" id="release-highlights">
           <div class="new-card reveal">
-            <span class="tagchip">Workspace</span>
-            <h3>One folder, one scan</h3>
-            <p>Repeated and stale folder bookmarks now collapse onto the same resolved folder. Reopening a workspace no
-              longer multiplies its sidebar roots and recursive scans.</p>
+            <span class="tagchip">Ask</span>
+            <h3>Edits the open document</h3>
+            <p>Ask can read, search, and edit the current document, including unsaved changes. Edits go through the
+              editor, with native Undo and Redo. Stop cancels the turn; leaving the document revokes access.</p>
           </div>
           <div class="new-card reveal">
-            <span class="tagchip">Native core</span>
-            <h3>Swift 6 throughout</h3>
-            <p>The app and tests now use Swift 6 with complete concurrency checking and explicit ownership of shared
-              state. Pensieve still runs on macOS 15 or newer.</p>
+            <span class="tagchip">Engine</span>
+            <h3>The engine ships inside</h3>
+            <p>Pensieve keeps its own AI engine configuration, credentials, and conversation history. Ask does not need
+              the Codescribe app, its account, or a companion process.</p>
           </div>
           <div class="new-card reveal">
             <span class="tagchip">Known limits</span>
-            <h3>AI and dictation are still evolving</h3>
-            <p>Dictation has an unresolved recording issue. Large AI rewrites can exceed provider limits, and custom
-              rewrite instructions still use a single-line field. These workflows are not qualified for this release.
-            </p>
+            <h3>Still not qualified</h3>
+            <p>Dictation is not part of this release. Whole-document Rewrite has no input chunking or context-budget
+              check. Scroll stability and Ask’s live provider flow are not yet verified on an installed build.</p>
           </div>
         </div>
       </div>
@@ -900,9 +907,14 @@
         </div>
         <aside class="download-panel reveal" aria-label="Download details">
           <dl>
-            <div>
+            <div id="published-version">
+              <!-- Published GitHub release (releases/latest), not the in-repo
+                   VERSION of unreleased main. The notarized lane requires this
+                   dd to match VERSION before publish. The page script rewrites
+                   the visible version, these notes, and the checksum from that
+                   same latest release when it can reach the GitHub API. -->
               <dt>Version</dt>
-              <dd>0.7.0</dd>
+              <dd>0.6.0</dd>
             </div>
             <div>
               <dt>Platform</dt>
@@ -923,7 +935,7 @@
                  SHA-256 of the DMG it just notarized (scripts/lib/landing-page.sh).
                  Keep exactly one checksum slot on the page and do not fill it by
                  hand — the release stamps it and then verifies it. -->
-          <div class="sha"><b>SHA-256</b><br />0f1c997a3afe19b51ec9e752e446082482c2816c8ee944a039d9873ad16e5706</div>
+          <div class="sha" id="release-sha"><b>SHA-256</b><br />0f1c997a3afe19b51ec9e752e446082482c2816c8ee944a039d9873ad16e5706</div>
         </aside>
       </div>
     </section>
@@ -961,6 +973,59 @@
           if (e.key === "Escape" && lightbox.classList.contains("open")) { close(); }
         });
       }
+    })();
+
+    (function () {
+      var versionNode = document.querySelector("#published-version dd");
+      if (!versionNode || !window.fetch) return;
+      var advertised = versionNode.textContent.replace(/\s+/g, "");
+      var notesNode = document.getElementById("github-release-notes");
+      var labelNode = document.getElementById("release-label");
+      var heroNode = document.getElementById("hero-version");
+      var highlights = document.getElementById("release-highlights");
+      var shaNode = document.getElementById("release-sha");
+
+      function semver(tag) {
+        var match = /^v?(\d+\.\d+\.\d+)/.exec(tag || "");
+        return match ? match[1] : "";
+      }
+
+      function applyVersion(version) {
+        versionNode.textContent = version;
+        if (heroNode) heroNode.textContent = version;
+        if (labelNode) labelNode.textContent = "Release " + version;
+        var ld = document.querySelector('script[type="application/ld+json"]');
+        if (!ld) return;
+        try {
+          var data = JSON.parse(ld.textContent);
+          data.softwareVersion = version;
+          ld.textContent = JSON.stringify(data);
+        } catch (ignore) { }
+      }
+
+      function applySha(hex) {
+        if (!shaNode || !/^[0-9a-f]{64}$/.test(hex)) return;
+        var br = shaNode.querySelector("br");
+        if (!br || !br.nextSibling) return;
+        br.nextSibling.nodeValue = hex;
+      }
+
+      fetch("https://api.github.com/repos/vetcoders/pensieve/releases/latest", {
+        headers: { Accept: "application/vnd.github+json" }
+      }).then(function (response) {
+        if (!response.ok) return null;
+        return response.json();
+      }).then(function (release) {
+        if (!release) return;
+        var version = semver(release.tag_name);
+        if (!version) return;
+        applyVersion(version);
+        var body = (release.body || "").replace(/^\s+|\s+$/g, "");
+        var sha = /SHA-256:\s*([0-9a-f]{64})/i.exec(body);
+        if (sha) applySha(sha[1]);
+        if (notesNode && body) notesNode.textContent = body;
+        if (highlights && version !== advertised) highlights.hidden = true;
+      }).catch(function () { });
     })();
 
     (function () {
