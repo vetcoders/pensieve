@@ -32,7 +32,9 @@ PUSH_REFS_FILE="$(mktemp -t "husky-${HUSKY_HOOK_NAME}-refs.XXXX")"
 trap 'rm -f "$LOG_FILE" "$PUSH_REFS_FILE"' EXIT
 
 # Capture refs from stdin (git invokes hook with refs on stdin).
-cat > "$PUSH_REFS_FILE" || true
+if [ ! -t 0 ]; then
+  cat > "$PUSH_REFS_FILE" || true
+fi
 
 set +e
 (

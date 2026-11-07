@@ -148,7 +148,7 @@ final class StdioVibecraftedMCPTransportTests: XCTestCase {
     XCTAssertThrowsError(
       try transport().callTool(
         commandPath: fixture.path, name: "fixture",
-        arguments: ["prompt": String(repeating: "x", count: 1024 * 1024)]))
+        arguments: ["prompt": .string(String(repeating: "x", count: 1024 * 1024))]))
     XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3.5)
     try fixture.assertStopped()
   }
@@ -165,6 +165,65 @@ final class StdioVibecraftedMCPTransportTests: XCTestCase {
     XCTAssertThrowsError(
       try transport().callTool(commandPath: fixture.path, name: "fixture", arguments: [:]))
     try fixture.assertStopped()
+  }
+
+  func testToolsListReportsJSONRPCErrorBeforeSchemaCheck() throws {
+    let fixture = try server(
+      """
+      json.loads(sys.stdin.buffer.readline())
+      send({'jsonrpc': '2.0', 'id': 1, 'result': {}})
+      json.loads(sys.stdin.buffer.readline())
+      list_req = json.loads(sys.stdin.buffer.readline())
+      assert list_req['method'] == 'tools/list' and list_req['id'] == 2
+      send({'jsonrpc': '2.0', 'id': 2, 'error': {'code': -32601, 'message': 'tools/list unavailable'}})
+      """)
+    defer { fixture.remove() }
+    let result = try transport().callTool(
+      commandPath: fixture.path,
+      name: "vc_run_launch",
+      arguments: ["model": .string("gpt-6.1-sol")])
+    XCTAssertEqual(result["ok"] as? Bool, false)
+    XCTAssertEqual(result["status"] as? String, "refused")
+    XCTAssertEqual(result["error"] as? String, "tools/list unavailable")
+  }
+
+  func testToolsListFollowsNextCursorAcrossPagesWithDistinctRequestIDs() throws {
+    let fixture = try server(
+      """
+      json.loads(sys.stdin.buffer.readline())
+      send({'jsonrpc': '2.0', 'id': 1, 'result': {}})
+      json.loads(sys.stdin.buffer.readline())
+      page1 = json.loads(sys.stdin.buffer.readline())
+      assert page1['method'] == 'tools/list' and page1['id'] == 2 and page1['params'] == {}
+      send({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': [{'name': 'vc_doctor'}], 'nextCursor': 'page-2'}})
+      page2 = json.loads(sys.stdin.buffer.readline())
+      assert page2['method'] == 'tools/list' and page2['id'] == 3 and page2['params'] == {'cursor': 'page-2'}
+      send({
+          'jsonrpc': '2.0',
+          'id': 3,
+          'result': {
+              'tools': [{
+                  'name': 'vc_run_launch',
+                  'inputSchema': {
+                      'properties': {
+                          'model': {'type': 'string'},
+                          'worktree': {'type': 'boolean'}
+                      }
+                  }
+              }]
+          }
+      })
+      call_req = json.loads(sys.stdin.buffer.readline())
+      assert call_req['method'] == 'tools/call' and call_req['id'] == 4
+      send({'jsonrpc': '2.0', 'id': 4, 'result': {'structuredContent': {'ok': True, 'run_id': 'run-paged'}}})
+      """)
+    defer { fixture.remove() }
+    let result = try transport().callTool(
+      commandPath: fixture.path,
+      name: "vc_run_launch",
+      arguments: ["model": .string("gpt-6.1-sol"), "worktree": .bool(true)])
+    XCTAssertEqual(result["ok"] as? Bool, true)
+    XCTAssertEqual(result["run_id"] as? String, "run-paged")
   }
 
   func testVersionProbeTimeoutKillsOnlyItsOwnStalledProcess() throws {

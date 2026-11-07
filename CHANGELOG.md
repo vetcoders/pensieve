@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedded engine's document tools on its live buffer, including unsaved text
   and native Undo/Redo. Opening returns a receipt, not the entire document.
 - Read the end of a document directly and page through literal search results.
+- Inline autocomplete now resolves through the 3-tier provider fallback chain
+  (signed-in OAuth account for OpenAI Codex, xAI Grok, or Google Gemini Cloud
+  Code Assist → local/cloud Libraxis → OpenRouter / manual API key) and updates
+  Settings readiness and status without requiring a typed API key.
 
 ### Changed
 
@@ -55,15 +59,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced by the shared surface above; the status bar, sidebar and editor
   invariants are unchanged, and Hide remains distinct from Stop.
 
+### Fixed
+
+- Detach `WKWebView` from its superview while a document window is an unselected
+  tab in a multi-window `NSWindowTabGroup` (observing `window.tabGroup`,
+  `tabGroup.selectedWindow`, and `tabGroup.windows` via KVO), cancel in-flight
+  preview JS updates on deselection, and skip background
+  `NSWindow.didUpdateNotification` chrome repair walks so background tabs no
+  longer wake `WebContent` processes or stall `WindowServer` / `screencapture`.
+- Exclude strict descendant workspace roots from ancestor root scans in
+  `WorkspaceScanner.build`, deduplicate overlapping candidate documents by
+  deepest `rootURL` in `IndexDatabase.prepareWorkspaceWritePlan` and
+  `AskThread.makeHost`, and exclude `worktrees` directories by default so nested
+  workspace roots are never double-scanned or double-indexed.
+- Bound inline candidate bodies in `IndexDatabase.prepareWorkspaceWritePlan` to
+  `4 MiB` with per-record `autoreleasepool` streaming, clear `NSURL`
+  `_FileCache` resource caches during scanning/indexing, preserve sorted CoW
+  `[WorkspaceNode]` buffers in `WorkspaceStore.sortNodes`, replace `NOT IN`
+  parameter lists in `tombstoneDocumentsNotIn` to avoid SQLite's 32,766-variable
+  limit, and invoke `malloc_zone_pressure_relief` after index writes.
+
 ### Release engineering
 
-- `make release-local NOTARIZE=true` builds a notarized, stapled `.app` and
-  DMG that publish nothing: no GitHub release, no `docs/index.html` checksum,
-  no internal release shelf. Until now the only way to get a notarized DMG
-  was `make release` or `make notarize`, and both publish a GitHub release
-  marked latest. `build-release.sh --no-publish` is the underlying flag.
-  The internal shelf now follows the same publishing condition as the page
-  and GitHub, instead of notarization alone.
+- `make release`, `make release-clean`, `make notarize`, and `make release-local NOTARIZE=true`
+  build, sign, notarize, and staple `.app` and DMG locally without publishing:
+  no GitHub release, no `docs/index.html` checksum rewrite, and no internal
+  release shelf copy (`DO_PUBLISH=0` by default in `scripts/build-release.sh`).
+  Outward publication is now explicit via `make publish` (`build-release.sh --publish`
+  or `--publish-only` when reusing an already-notarized local bundle/DMG for `HEAD`),
+  accompanied by `make release-prepare`, `make version-bump`, `make version-check`,
+  `make changelog-close`, `make release-notes`, `make release-plan`, `make release-check`,
+  `make release-tag`, and `make release-push`.
 
 ## [0.6.0] - 2026-09-29
 

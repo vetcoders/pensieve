@@ -77,11 +77,29 @@ else
 fi
 
 if HELP_OUT="$("$RELEASE_SCRIPT" --no-publish --help 2>&1)" \
-    && grep -q -- '--no-publish' <<<"$HELP_OUT"; then
-    pass "build-release.sh accepts --no-publish and documents it"
+    && grep -q -- '--no-publish' <<<"$HELP_OUT" \
+    && grep -q -- '--publish' <<<"$HELP_OUT" \
+    && grep -q -- '--publish-only' <<<"$HELP_OUT"; then
+    pass "build-release.sh accepts --publish, --publish-only, and --no-publish and documents them"
 else
-    fail "build-release.sh accepts --no-publish and documents it" \
-        "'--no-publish --help' failed or the help text does not name the flag"
+    fail "build-release.sh accepts --publish, --publish-only, and --no-publish and documents them" \
+        "'--help' failed or the help text does not name --publish / --publish-only / --no-publish"
+fi
+
+if grep -q '^DO_PUBLISH=0$' "$RELEASE_SCRIPT"; then
+    pass "build-release.sh defaults to DO_PUBLISH=0 (make release is local-only)"
+else
+    fail "build-release.sh defaults to DO_PUBLISH=0 (make release is local-only)" \
+        "DO_PUBLISH=0 default missing from build-release.sh"
+fi
+
+PUBLISH_DRY="$(env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u NOTARIZE \
+    make --no-print-directory -n -C "$REPO_ROOT" publish 2>&1)"
+if grep -q 'build-release.sh --publish' <<<"$PUBLISH_DRY"; then
+    pass "make publish invokes build-release.sh --publish / --publish-only"
+else
+    fail "make publish invokes build-release.sh --publish / --publish-only" \
+        "make -n publish did not reference build-release.sh --publish: $PUBLISH_DRY"
 fi
 
 if "$RELEASE_SCRIPT" --no-publsh >/dev/null 2>&1; then

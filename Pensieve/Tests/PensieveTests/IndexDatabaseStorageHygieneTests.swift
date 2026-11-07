@@ -2014,6 +2014,59 @@ final class IndexDatabaseStorageHygieneTests: XCTestCase {
     pumpMainRunLoop(until: { backlinksFinished.isSet }, timeout: 10)
   }
 
+  func testWorkspaceDefaultExclusionsSkipWorktreesDirectory() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let harness = try makeWorkspaceHarness(in: sandbox.support)
+    let workspace = sandbox.root.appendingPathComponent("VibeRoot", isDirectory: true)
+    let worktrees = workspace.appendingPathComponent("worktrees/agent-run", isDirectory: true)
+    try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
+    try "# Kept".write(
+      to: workspace.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+    try "# Ephemeral worktree clone".write(
+      to: worktrees.appendingPathComponent("CLONE.md"), atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    harness.manager.open(url: workspace, into: appState)
+    await settle(harness)
+
+    XCTAssertEqual(appState.documents.map(\.url.lastPathComponent), ["README.md"])
+  }
+
+  func testRestoreLastFolderInBackgroundIfNeededSkipsWhenWorkspaceAlreadyLoaded() async throws {
+    let sandbox = try makeWorkspaceSandbox()
+    let harness = try makeWorkspaceHarness(in: sandbox.support)
+    let workspace = sandbox.root.appendingPathComponent("Notes", isDirectory: true)
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    try "# First".write(
+      to: workspace.appendingPathComponent("first.md"), atomically: true, encoding: .utf8)
+
+    let appState = AppState()
+    harness.manager.open(url: workspace, into: appState)
+    await settle(harness)
+
+    let revisionBefore = appState.sortedWorkspaceTreeRevision
+    XCTAssertFalse(appState.workspaceTree.isEmpty)
+
+    harness.manager.restoreLastFolderInBackgroundIfNeeded(into: appState)
+    await settle(harness)
+    XCTAssertEqual(appState.sortedWorkspaceTreeRevision, revisionBefore)
+  }
+
+  func testSortedWorkspaceTreeRevisionIncrementsMonotonically() {
+    let appState = AppState()
+    let initial = appState.sortedWorkspaceTreeRevision
+    appState.workspaceTree = [
+      WorkspaceNode(
+        id: "doc:1",
+        name: "note",
+        kind: .document,
+        url: URL(fileURLWithPath: "/tmp/note.md"),
+        children: nil
+      )
+    ]
+    XCTAssertEqual(appState.sortedWorkspaceTreeRevision, initial + 1)
+  }
+
   // MARK: - Ordering fixtures
 
   /// How long the wedged writer is held before a safety valve frees it. Generously above the bound

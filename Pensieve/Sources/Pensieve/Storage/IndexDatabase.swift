@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import GRDB
 import os
@@ -2165,8 +2166,8 @@ final class IndexDatabase {
       // search hits. For single-root the per-root id IS `identity.workspaceID`
       // byte-for-byte, so this is a no-op there. The merged identity still anchors the
       // workspaces REGISTRY row below (manifest / scan_session / stats key on it).
-      let records = await Task.detached(priority: .utility) {
-        documents.compactMap(Self.documentWriteRecord)
+      let plan = await Task.detached(priority: .utility) {
+        Self.prepareWorkspaceWritePlan(for: documents, pool: pool)
       }.value
       guard
         databaseURL.map({ FileManager.default.fileExists(atPath: $0.path) }) ?? true
@@ -2180,37 +2181,35 @@ final class IndexDatabase {
           // stats anchor). Document rows below live under their per-root workspace_ids.
           try Self.upsertWorkspace(identity: identity, roots: roots, lastSeenAt: lastSeenAt, in: db)
 
-          // Group the documents by their per-root workspace_id, then run the SAME
-          // per-workspace writer the single-root path always used (`indexed_at =
+          // Group the candidate documents by their per-root workspace_id, then run the
+          // SAME per-workspace writer the single-root path always used (`indexed_at =
           // lastSeenAt`, unchanged-row skip, batched `didInsertBatch` observability) —
-          // once per group instead of once under the merged identity. Single-root has
-          // exactly one group whose id IS `identity.workspaceID`, so its write is
-          // byte-identical; multi-root fans out to one group per root.
-          let recordsByWorkspace = Dictionary(grouping: records, by: \.workspaceID)
-          for (workspaceID, group) in recordsByWorkspace {
+          // once per touched workspace instead of once under the merged identity.
+          let recordsByWorkspace = Dictionary(grouping: plan.records, by: \.workspaceID)
+          for (workspaceID, canonicalPath) in plan.canonicalByWorkspace {
             try Self.abandonIfClosedForTermination(latch)
             // FK target: the per-root workspaces row, mapped to its real canonical_path
             // so the search full-path reconstruction (canonical_path || '/' || path)
             // stays correct for every root.
             try Self.ensureWorkspaceRow(
-              workspaceID: workspaceID, canonicalPath: group[0].canonicalPath, in: db)
-            try Self.upsertDocuments(
-              records: group.map {
-                IndexDocumentRecord(
-                  path: $0.path, title: $0.title, body: $0.body,
-                  mtime: $0.mtime, size: $0.size, isAdHoc: $0.isAdHoc)
-              },
-              workspaceID: workspaceID,
-              indexedAt: lastSeenAt,
-              batchSize: batchSize,
-              didInsertBatch: didInsertBatch,
-              latch: latch,
-              in: db
-            )
+              workspaceID: workspaceID, canonicalPath: canonicalPath, in: db)
+            if let group = recordsByWorkspace[workspaceID], !group.isEmpty {
+              try Self.upsertDocuments(
+                records: group,
+                workspaceID: workspaceID,
+                indexedAt: lastSeenAt,
+                batchSize: batchSize,
+                didInsertBatch: didInsertBatch,
+                latch: latch,
+                in: db
+              )
+            }
             try Self.tombstoneDocumentsNotIn(
-              paths: group.map(\.path), workspaceID: workspaceID, in: db)
+              paths: Array(plan.keptPathsByWorkspace[workspaceID] ?? []),
+              workspaceID: workspaceID,
+              in: db)
           }
-          if recordsByWorkspace.isEmpty {
+          if plan.canonicalByWorkspace.isEmpty {
             // No documents this commit: preserve the legacy empty-wipe under the
             // workspace identity (single-root → its own rows; multi-root W_AB owns
             // no document rows, so this is a harmless no-op).
@@ -2218,6 +2217,7 @@ final class IndexDatabase {
               paths: [], workspaceID: identity.workspaceID, in: db)
           }
         }
+        malloc_zone_pressure_relief(nil, 0)
       }.value
     } catch is IndexWriteAbandonedAfterTermination {
       Self.logAbandonedWriteAfterTermination("upsertWorkspace")
@@ -2288,34 +2288,38 @@ final class IndexDatabase {
     didInsertBatch: (@Sendable (Int) -> Void)?,
     latch: TerminationLatch
   ) throws {
-    let records = documents.compactMap { documentWriteRecord(from: $0) }
+    let plan = prepareWorkspaceWritePlan(for: documents, pool: pool)
 
     try pool.write { db in
       try abandonIfClosedForTermination(latch)
       // Workspaces represented in this reindex (so tombstoning is scoped to them),
       // each mapped to its REAL canonical_path so the search full-path
       // reconstruction (canonical_path || '/' || path) is correct.
-      var canonicalByWorkspace: [String: String] = [:]
-      for record in records where canonicalByWorkspace[record.workspaceID] == nil {
-        canonicalByWorkspace[record.workspaceID] = record.canonicalPath
-      }
-      let touchedWorkspaces = Set(canonicalByWorkspace.keys)
-      for (workspaceID, canonicalPath) in canonicalByWorkspace {
+      let touchedWorkspaces = Set(plan.canonicalByWorkspace.keys)
+      for (workspaceID, canonicalPath) in plan.canonicalByWorkspace {
         try ensureWorkspaceRow(workspaceID: workspaceID, canonicalPath: canonicalPath, in: db)
       }
 
       var batch: [DocumentWriteRecord] = []
       batch.reserveCapacity(batchSize)
-      var keptPathsByWorkspace: [String: Set<String>] = [:]
 
-      for record in records {
-        keptPathsByWorkspace[record.workspaceID, default: []].insert(record.path)
+      for record in plan.records {
         // Skip the write (and the count) when the stored row already matches —
         // the unchanged-relaunch / double-write-collapse case.
-        if try existingDocumentMatches(record, in: db) {
+        let resolvedRecord = try autoreleasepool { () -> DocumentWriteRecord? in
+          guard let body = record.resolvedBody() else { return nil }
+          guard try !existingDocumentMatches(record, withBody: body, in: db) else {
+            return nil
+          }
+          var resolved = record
+          resolved.inlineBody = body
+          resolved.bodyURL = nil
+          return resolved
+        }
+        guard let resolvedRecord else {
           continue
         }
-        batch.append(record)
+        batch.append(resolvedRecord)
         if batch.count == batchSize {
           try abandonIfClosedForTermination(latch)
           try upsertDocuments(batch, in: db)
@@ -2332,11 +2336,12 @@ final class IndexDatabase {
       // Tombstone removed docs ONLY within the workspaces this reindex covered.
       for workspaceID in touchedWorkspaces {
         try tombstoneDocumentsNotIn(
-          paths: Array(keptPathsByWorkspace[workspaceID] ?? []),
+          paths: Array(plan.keptPathsByWorkspace[workspaceID] ?? []),
           workspaceID: workspaceID,
           in: db)
       }
     }
+    malloc_zone_pressure_relief(nil, 0)
   }
 
   /// Incremental apply, documents-as-source: upserts ONLY the supplied docs and
@@ -2380,7 +2385,11 @@ final class IndexDatabase {
         // the changed docs before this delta runs (the double-write collapse).
         // A genuine delta (watcher/refresh) almost always sees a real change, so
         // this only suppresses redundant re-writes.
-        if try existingDocumentMatches(record, in: db) {
+        let shouldWrite = try autoreleasepool { () -> Bool in
+          guard let body = record.resolvedBody() else { return false }
+          return try !existingDocumentMatches(record, withBody: body, in: db)
+        }
+        if !shouldWrite {
           continue
         }
         batch.append(record)
@@ -2468,22 +2477,249 @@ final class IndexDatabase {
 
   /// True when the stored `documents` row for `(workspace_id, path)` already
   /// byte-matches the candidate (title/body/mtime/size) — i.e. an upsert would be
-  /// a no-op. Used by `replaceSearchIndex` to skip (and not count) unchanged docs.
+  /// a no-op. Used by `replaceSearchIndex` and `upsertWorkspace` to skip (and not
+  /// count) unchanged docs without reading `body` out of SQLite when metadata differs.
   private nonisolated static func existingDocumentMatches(
-    _ record: DocumentWriteRecord, in db: Database
+    _ record: DocumentWriteRecord, withBody body: String, in db: Database
   ) throws -> Bool {
-    let row = try Row.fetchOne(
+    let metaRow = try Row.fetchOne(
       db,
       sql: """
-        SELECT title, body, mtime, size FROM documents
+        SELECT title, mtime, size FROM documents
         WHERE workspace_id = ? AND path = ? LIMIT 1
         """,
       arguments: [record.workspaceID, record.path])
-    guard let row else { return false }
-    return (row["title"] as String) == record.title
-      && (row["body"] as String) == record.body
-      && (row["mtime"] as Int) == record.mtime
-      && (row["size"] as Int) == record.size
+    guard
+      let metaRow,
+      (metaRow["mtime"] as Int) == record.mtime,
+      (metaRow["size"] as Int) == record.size,
+      (metaRow["title"] as String) == record.title
+    else { return false }
+    guard
+      let storedBody = try String.fetchOne(
+        db,
+        sql: """
+          SELECT body FROM documents
+          WHERE workspace_id = ? AND path = ? LIMIT 1
+          """,
+        arguments: [record.workspaceID, record.path])
+    else { return false }
+    return storedBody == body
+  }
+
+  /// Maximum cumulative UTF-8 bytes of document bodies kept inline in
+  /// `PreparedWorkspaceWritePlan.records` before remaining candidates defer body
+  /// loading to per-record `autoreleasepool` reads during the write pass.
+  private nonisolated static let maxInlineWritePlanBodyBytes = 4 * 1024 * 1024
+
+  private struct PreparedWorkspaceWritePlan: Sendable {
+    var records: [DocumentWriteRecord]
+    var canonicalByWorkspace: [String: String]
+    var keptPathsByWorkspace: [String: Set<String>]
+  }
+
+  /// Builds the candidate `DocumentWriteRecord` set and per-workspace path inventory
+  /// for `upsertWorkspace` and `replaceSearchIndex` without loading unchanged historical
+  /// document bodies into memory, and bounds inline candidate bodies to
+  /// `maxInlineWritePlanBodyBytes` so cold reindexing 100k+ files never retains gigabytes
+  /// of `String` buffers simultaneously.
+  private nonisolated static func prepareWorkspaceWritePlan(
+    for documents: [DocumentRef],
+    pool: DatabasePool
+  ) -> PreparedWorkspaceWritePlan {
+    guard !documents.isEmpty else {
+      return PreparedWorkspaceWritePlan(
+        records: [], canonicalByWorkspace: [:], keptPathsByWorkspace: [:])
+    }
+
+    struct ResolvedDocMeta {
+      var document: DocumentRef
+      var url: URL
+      var workspaceID: String
+      var canonicalPath: String
+      var storedPath: String
+      var isAdHoc: Bool
+    }
+
+    var rootIdentityCache: [URL: WorkspaceIdentity] = [:]
+    var rawResolvedDocs: [ResolvedDocMeta] = []
+    rawResolvedDocs.reserveCapacity(documents.count)
+    var touchedWorkspaceIDs = Set<String>()
+    var canonicalByWorkspace: [String: String] = [:]
+
+    for document in documents {
+      let url = document.url.standardizedFileURL
+      if !document.isAdHoc, let rootURL = document.rootURL {
+        let stdRoot = rootURL.standardizedFileURL
+        let identity: WorkspaceIdentity
+        if let cached = rootIdentityCache[stdRoot] {
+          identity = cached
+        } else {
+          let created = WorkspaceIdentity.make(rootURL: stdRoot, bookmarkData: nil)
+          rootIdentityCache[stdRoot] = created
+          identity = created
+        }
+        let storedPath = document.relativePath ?? url.lastPathComponent
+        touchedWorkspaceIDs.insert(identity.workspaceID)
+        if canonicalByWorkspace[identity.workspaceID] == nil {
+          canonicalByWorkspace[identity.workspaceID] = identity.canonicalRootURL.path
+        }
+        rawResolvedDocs.append(
+          ResolvedDocMeta(
+            document: document,
+            url: url,
+            workspaceID: identity.workspaceID,
+            canonicalPath: identity.canonicalRootURL.path,
+            storedPath: storedPath,
+            isAdHoc: false
+          ))
+      } else {
+        touchedWorkspaceIDs.insert(Self.adHocWorkspaceID)
+        rawResolvedDocs.append(
+          ResolvedDocMeta(
+            document: document,
+            url: url,
+            workspaceID: Self.adHocWorkspaceID,
+            canonicalPath: "",
+            storedPath: url.path,
+            isAdHoc: true
+          ))
+      }
+    }
+
+    // When a caller supplies documents from nested roots (e.g. ~/.vibecrafted and
+    // ~/.vibecrafted/artifacts), attribute each standardized file path once to its
+    // most specific (deepest) root so the parent workspace never double-indexes it
+    // and tombstones any historical duplicate rows under the parent workspace_id.
+    var bestIndexByFilePath: [String: Int] = [:]
+    bestIndexByFilePath.reserveCapacity(rawResolvedDocs.count)
+    for (index, meta) in rawResolvedDocs.enumerated() {
+      let filePath = meta.url.path
+      if let existingIndex = bestIndexByFilePath[filePath] {
+        let existing = rawResolvedDocs[existingIndex]
+        if (!meta.isAdHoc && existing.isAdHoc)
+          || meta.canonicalPath.count > existing.canonicalPath.count
+        {
+          bestIndexByFilePath[filePath] = index
+        }
+      } else {
+        bestIndexByFilePath[filePath] = index
+      }
+    }
+    let resolvedDocs: [ResolvedDocMeta]
+    var shadowedWorkspaces = Set<String>()
+    if bestIndexByFilePath.count == rawResolvedDocs.count {
+      resolvedDocs = rawResolvedDocs
+    } else {
+      let chosenIndices = Set(bestIndexByFilePath.values)
+      resolvedDocs = rawResolvedDocs.enumerated().compactMap { index, meta in
+        if chosenIndices.contains(index) {
+          return meta
+        }
+        if !meta.isAdHoc {
+          shadowedWorkspaces.insert(meta.workspaceID)
+        }
+        return nil
+      }
+    }
+
+    let existingStats: [String: [String: (mtime: Int, size: Int)]] =
+      (try? pool.read { db in
+        var result: [String: [String: (mtime: Int, size: Int)]] = [:]
+        for wsID in touchedWorkspaceIDs {
+          let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT path, mtime, size FROM documents WHERE workspace_id = ?",
+            arguments: [wsID]
+          )
+          var byPath: [String: (mtime: Int, size: Int)] = [:]
+          byPath.reserveCapacity(rows.count)
+          for row in rows {
+            let path: String = row["path"]
+            let mtime: Int = row["mtime"]
+            let size: Int = row["size"]
+            byPath[path] = (mtime, size)
+          }
+          result[wsID] = byPath
+        }
+        return result
+      }) ?? [:]
+
+    let now = Date().timeIntervalSince1970
+    var records: [DocumentWriteRecord] = []
+    var keptPathsByWorkspace: [String: Set<String>] = [:]
+    var activeWorkspaces = Set<String>()
+    var inlineBodyBytes = 0
+
+    for meta in resolvedDocs {
+      autoreleasepool {
+        var statURL = meta.url
+        defer { statURL.removeAllCachedResourceValues() }
+        let values = try? statURL.resourceValues(forKeys: [
+          .contentModificationDateKey, .fileSizeKey, .isReadableKey,
+        ])
+        if let modifiedAt = values?.contentModificationDate?.timeIntervalSince1970,
+          let fileSize = values?.fileSize,
+          values?.isReadable == true,
+          now - modifiedAt >= 2.0,
+          let existing = existingStats[meta.workspaceID]?[meta.storedPath],
+          existing.mtime == Int(modifiedAt),
+          existing.size == fileSize
+        {
+          activeWorkspaces.insert(meta.workspaceID)
+          if canonicalByWorkspace[meta.workspaceID] == nil {
+            canonicalByWorkspace[meta.workspaceID] = meta.canonicalPath
+          }
+          keptPathsByWorkspace[meta.workspaceID, default: []].insert(meta.storedPath)
+          return
+        }
+
+        guard let body = try? String(contentsOf: meta.url, encoding: .utf8) else { return }
+        let modifiedAt =
+          values?.contentModificationDate?.timeIntervalSince1970 ?? now
+        let size = values?.fileSize ?? body.utf8.count
+        let docTitle = title(fromMarkdown: body, fallback: meta.document.title)
+        let keepInline = inlineBodyBytes + size <= Self.maxInlineWritePlanBodyBytes
+        if keepInline {
+          inlineBodyBytes += size
+        }
+        let record = DocumentWriteRecord(
+          workspaceID: meta.workspaceID,
+          canonicalPath: meta.canonicalPath,
+          path: meta.storedPath,
+          title: docTitle,
+          body: keepInline ? body : nil,
+          bodyURL: keepInline ? nil : meta.url,
+          mtime: Int(modifiedAt),
+          size: size,
+          isAdHoc: meta.isAdHoc
+        )
+        activeWorkspaces.insert(meta.workspaceID)
+        if canonicalByWorkspace[meta.workspaceID] == nil {
+          canonicalByWorkspace[meta.workspaceID] = meta.canonicalPath
+        }
+        keptPathsByWorkspace[meta.workspaceID, default: []].insert(meta.storedPath)
+        records.append(record)
+      }
+    }
+
+    // If a workspace had documents passed in, only keep canonicalByWorkspace entries
+    // for workspaces that either had at least one readable document OR had all their
+    // documents shadowed by a nested child root (so tombstoneDocumentsNotIn cleans
+    // any stale duplicate rows in the parent workspace).
+    if activeWorkspaces.isEmpty && shadowedWorkspaces.isEmpty {
+      canonicalByWorkspace.removeAll()
+    } else {
+      canonicalByWorkspace = canonicalByWorkspace.filter { wsID, _ in
+        activeWorkspaces.contains(wsID) || shadowedWorkspaces.contains(wsID)
+      }
+    }
+
+    return PreparedWorkspaceWritePlan(
+      records: records,
+      canonicalByWorkspace: canonicalByWorkspace,
+      keptPathsByWorkspace: keptPathsByWorkspace
+    )
   }
 
   /// Resolves a `DocumentRef` (+ on-disk body) to a `DocumentWriteRecord`. Returns
@@ -2589,13 +2825,16 @@ final class IndexDatabase {
     _ records: [DocumentWriteRecord], in db: Database
   ) throws {
     for record in records {
-      try upsertDocument(record, in: db)
+      try autoreleasepool {
+        try upsertDocument(record, in: db)
+      }
     }
   }
 
   private nonisolated static func upsertDocument(_ record: DocumentWriteRecord, in db: Database)
     throws
   {
+    guard let body = record.inlineBody ?? record.resolvedBody() else { return }
     let now = Int(Date().timeIntervalSince1970)
     try db.execute(
       sql: """
@@ -2614,7 +2853,7 @@ final class IndexDatabase {
         record.workspaceID,
         record.path,
         record.title,
-        record.body,
+        body,
         record.mtime,
         record.size,
         record.isAdHoc ? 1 : 0,
@@ -2654,7 +2893,7 @@ final class IndexDatabase {
   }
 
   private nonisolated static func upsertDocuments(
-    records: [IndexDocumentRecord],
+    records: [DocumentWriteRecord],
     workspaceID: String,
     indexedAt: Date,
     batchSize: Int = 1,
@@ -2665,74 +2904,47 @@ final class IndexDatabase {
     let timestamp = Int(indexedAt.timeIntervalSince1970)
     var changedInBatch = 0
     for record in records {
-      // INCREMENTAL: only (re)write a row whose indexed content (title/body/mtime/
-      // size) is new or changed. An unchanged re-upsert is not just a no-op for the
-      // content — its `ON CONFLICT DO UPDATE` still fires the `documents` AU trigger,
-      // which deletes + reinserts the row's entry in the external-content
-      // `document_fts`. Re-committing all N documents on a cold open therefore
-      // re-tokenizes the WHOLE workspace even when a single file changed — the
-      // "Indexing N" reindex storm. Skipping the matching rows means only the
-      // genuinely added/modified file fires a trigger, so a file add/remove is cheap.
-      // Removed paths are tombstoned by the caller's `tombstoneDocumentsNotIn`.
-      let changed = try !workspaceDocumentMatches(record, workspaceID: workspaceID, in: db)
-      guard changed else { continue }
-      try db.execute(
-        sql: """
-          INSERT INTO documents
-              (workspace_id, path, title, body, mtime, size, is_ad_hoc, indexed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(workspace_id, path) DO UPDATE SET
-              title = excluded.title,
-              body = excluded.body,
-              mtime = excluded.mtime,
-              size = excluded.size,
-              is_ad_hoc = excluded.is_ad_hoc,
-              indexed_at = excluded.indexed_at
-          """,
-        arguments: [
-          workspaceID,
-          record.path,
-          record.title,
-          record.body,
-          record.mtime,
-          record.size,
-          record.isAdHoc ? 1 : 0,
-          timestamp,
-        ]
-      )
+      let didChange = try autoreleasepool { () -> Bool in
+        guard let body = record.resolvedBody() else { return false }
+        let changed = try !existingDocumentMatches(record, withBody: body, in: db)
+        guard changed else { return false }
+        try db.execute(
+          sql: """
+            INSERT INTO documents
+                (workspace_id, path, title, body, mtime, size, is_ad_hoc, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, path) DO UPDATE SET
+                title = excluded.title,
+                body = excluded.body,
+                mtime = excluded.mtime,
+                size = excluded.size,
+                is_ad_hoc = excluded.is_ad_hoc,
+                indexed_at = excluded.indexed_at
+            """,
+          arguments: [
+            workspaceID,
+            record.path,
+            record.title,
+            body,
+            record.mtime,
+            record.size,
+            record.isAdHoc ? 1 : 0,
+            timestamp,
+          ]
+        )
+        return true
+      }
+      guard didChange else { continue }
       changedInBatch += 1
       if changedInBatch == batchSize {
         didInsertBatch?(changedInBatch)
         changedInBatch = 0
-        // The workspace-manifest twin of the reindex/delta batch consultation, and the same
-        // granularity: a batch is never STARTED after the latch closed. Placed here rather than at
-        // the head of the loop because this writer batches per WRITTEN row — an unchanged row is
-        // skipped before it counts, so "start of a batch" is the boundary, not the iteration.
         try abandonIfClosedForTermination(latch)
       }
     }
     if changedInBatch > 0 {
       didInsertBatch?(changedInBatch)
     }
-  }
-
-  /// True when the stored `documents` row for `(workspaceID, record.path)` already
-  /// byte-matches the candidate's indexed content (title/body/mtime/size).
-  private nonisolated static func workspaceDocumentMatches(
-    _ record: IndexDocumentRecord, workspaceID: String, in db: Database
-  ) throws -> Bool {
-    let row = try Row.fetchOne(
-      db,
-      sql: """
-        SELECT title, body, mtime, size FROM documents
-        WHERE workspace_id = ? AND path = ? LIMIT 1
-        """,
-      arguments: [workspaceID, record.path])
-    guard let row else { return false }
-    return (row["title"] as String) == record.title
-      && (row["body"] as String) == record.body
-      && (row["mtime"] as Int) == record.mtime
-      && (row["size"] as Int) == record.size
   }
 
   private nonisolated static func tombstoneDocumentsNotIn(
@@ -2745,17 +2957,18 @@ final class IndexDatabase {
       return
     }
 
-    let placeholders = Array(repeating: "?", count: paths.count).joined(separator: ", ")
-    var arguments: StatementArguments = [workspaceID]
-    arguments += StatementArguments(paths)
-    try db.execute(
-      sql: """
-        DELETE FROM documents
-        WHERE workspace_id = ?
-          AND path NOT IN (\(placeholders))
-        """,
-      arguments: arguments
-    )
+    let keptSet = Set(paths)
+    let staleIDs = try Row.fetchAll(
+      db,
+      sql: "SELECT id, path FROM documents WHERE workspace_id = ?",
+      arguments: [workspaceID]
+    ).compactMap { row -> Int64? in
+      let path: String = row["path"]
+      return keptSet.contains(path) ? nil : (row["id"] as Int64)
+    }
+    for staleID in staleIDs {
+      try db.execute(sql: "DELETE FROM documents WHERE id = ?", arguments: [staleID])
+    }
   }
 
   private nonisolated static func title(fromMarkdown body: String, fallback: String) -> String {
@@ -3351,19 +3564,39 @@ private struct DocumentWriteRecord: Sendable {
   var canonicalPath: String
   var path: String
   var title: String
-  var body: String
+  var inlineBody: String?
+  var bodyURL: URL?
   var mtime: Int
   var size: Int
   var isAdHoc: Bool
-}
 
-private struct IndexDocumentRecord: Sendable {
-  var path: String
-  var title: String
-  var body: String
-  var mtime: Int
-  var size: Int
-  var isAdHoc: Bool
+  init(
+    workspaceID: String,
+    canonicalPath: String,
+    path: String,
+    title: String,
+    body: String? = nil,
+    bodyURL: URL? = nil,
+    mtime: Int,
+    size: Int,
+    isAdHoc: Bool
+  ) {
+    self.workspaceID = workspaceID
+    self.canonicalPath = canonicalPath
+    self.path = path
+    self.title = title
+    self.inlineBody = body
+    self.bodyURL = bodyURL
+    self.mtime = mtime
+    self.size = size
+    self.isAdHoc = isAdHoc
+  }
+
+  func resolvedBody() -> String? {
+    if let inlineBody { return inlineBody }
+    guard let bodyURL else { return nil }
+    return try? String(contentsOf: bodyURL, encoding: .utf8)
+  }
 }
 
 /// Lock-guarded mirror of `IndexDatabase.isClosedForTermination`, readable from the detached

@@ -26,6 +26,28 @@ struct WorkflowCapabilities: Equatable, Sendable {
     let defaultAgents: [String]
   }
 
+  struct Provider: Equatable, Sendable, Decodable {
+    struct ModelOverride: Equatable, Sendable, Decodable {
+      let supported: Bool
+      let reason: String?
+    }
+    let modelOverride: ModelOverride
+    enum CodingKeys: String, CodingKey { case modelOverride = "model_override" }
+  }
+
+  struct Environment: Equatable, Sendable, Decodable {
+    let label: String
+    let available: Bool
+    let reason: String
+    let skillLauncherSupported: Bool
+    let skillLauncherFlags: [String]
+    enum CodingKeys: String, CodingKey {
+      case label, available, reason
+      case skillLauncherSupported = "skill_launcher_supported"
+      case skillLauncherFlags = "skill_launcher_flags"
+    }
+  }
+
   struct Workflow: Equatable, Sendable {
     let name: String
     let aliases: [String]
@@ -44,6 +66,23 @@ struct WorkflowCapabilities: Equatable, Sendable {
   let agents: [String]
   let research: Research?
   let workflows: [Workflow]
+  var providers: [String: Provider] = [:]
+  var environments: [String: Environment] = [:]
+
+  func supportsModelOverride(agent: String) -> Bool {
+    providers[agent]?.modelOverride.supported == true
+  }
+
+  /// The MCP launch contract currently supports the checkout/worktree override.
+  /// Other runtime classes remain visible with their producer-owned refusal;
+  /// they never collapse silently into a local checkout.
+  func supportsWorktreeOverride(_ worktree: Bool) -> Bool {
+    let id = worktree ? "local-worktrees" : "local-native"
+    guard let environment = environments[id], environment.available,
+      environment.skillLauncherSupported
+    else { return false }
+    return environment.skillLauncherFlags == (worktree ? ["--worktree", "true"] : [])
+  }
 
   /// Descriptor lookup by canonical name or alias (`justdo` → `implement`).
   func workflow(named name: String) -> Workflow? {
@@ -83,7 +122,17 @@ struct WorkflowCapabilities: Equatable, Sendable {
 
 extension WorkflowCapabilities: Decodable {
   enum CodingKeys: String, CodingKey {
-    case agents, research, workflows
+    case agents, research, workflows, providers, environments
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    agents = try values.decode([String].self, forKey: .agents)
+    research = try values.decodeIfPresent(Research.self, forKey: .research)
+    workflows = try values.decode([Workflow].self, forKey: .workflows)
+    providers = try values.decodeIfPresent([String: Provider].self, forKey: .providers) ?? [:]
+    environments =
+      try values.decodeIfPresent([String: Environment].self, forKey: .environments) ?? [:]
   }
 }
 

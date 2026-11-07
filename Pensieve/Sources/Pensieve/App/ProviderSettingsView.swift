@@ -69,11 +69,15 @@ struct ProviderSettingsView: View {
           }
           .accessibilityIdentifier("pensieve.provider.discoveredModel")
         }
-        SecureField("API Key", text: $settings.apiKey, prompt: Text("Optional for local providers"))
-          .accessibilityIdentifier("pensieve.provider.apiKey")
-          .onChange(of: settings.apiKey) {
-            settings.providerDiscoveryInputDidChange()
-          }
+        SecureField(
+          "API Key",
+          text: $settings.apiKey,
+          prompt: Text("Optional with OAuth, Libraxis, or local providers")
+        )
+        .accessibilityIdentifier("pensieve.provider.apiKey")
+        .onChange(of: settings.apiKey) {
+          settings.providerDiscoveryInputDidChange()
+        }
         Button("Forget Saved API Key", role: .destructive) {
           try? settings.forgetSavedAPIKey()
         }
@@ -109,6 +113,16 @@ struct ProviderSettingsView: View {
             .font(.caption)
             .foregroundStyle(.green)
             .accessibilityIdentifier("pensieve.provider.saved")
+        } else if grokAccount.snapshot.isSignedIn || codexAccount.snapshot.isSignedIn
+          || settings.isOAuthAccountSignedIn
+        {
+          Label(
+            "OAuth account active for Ask and inline autocomplete (with Libraxis → OpenRouter fallback).",
+            systemImage: "checkmark.seal.fill"
+          )
+          .font(.caption)
+          .foregroundStyle(.green)
+          .accessibilityIdentifier("pensieve.provider.oauthActive")
         } else if settings.usesInheritedEnvironmentAtLaunch {
           Label("A provider is already set up by your environment.", systemImage: "terminal")
             .font(.caption)

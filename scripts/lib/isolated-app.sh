@@ -1033,6 +1033,12 @@ isolated_app_owner_contains_only_direct_paths() {
     shopt -s dotglob nullglob
     children=("$owner_root"/*)
     for observed in "${children[@]}"; do
+      # Finder writes view state into any directory a window has shown. That
+      # regular file is neither payload nor cleanup authority; a symlink or a
+      # directory with the same name stays an unknown child.
+      if [[ "$observed" == "$owner_root/.DS_Store" && -f "$observed" && ! -L "$observed" ]]; then
+        continue
+      fi
       is_allowed=0
       for allowed in "$@"; do
         if [[ "$observed" == "$allowed" ]]; then
@@ -1048,6 +1054,16 @@ isolated_app_owner_contains_only_direct_paths() {
     done
     return 0
   )
+}
+
+# Retire Finder's view state before the owner capsule's rmdir. Only a regular
+# file qualifies, matching the census above; anything else keeps rmdir failing.
+isolated_app_remove_owner_finder_metadata() {
+  local finder="${1:-}/.DS_Store"
+  if [[ -f "$finder" && ! -L "$finder" ]]; then
+    /bin/rm -f -- "$finder" || return 1
+  fi
+  return 0
 }
 
 isolated_app_sign_bundle() {
@@ -2427,6 +2443,7 @@ isolated_app_cleanup_manifest() {
     isolated_app_remove_exact_path \
       "$reservation_partial" "reservation manifest partial" || return 1
     isolated_app_remove_exact_path "$final_partial" "final manifest partial" || return 1
+    isolated_app_remove_owner_finder_metadata "$expected_owner_root" || return 1
     if ! /bin/rmdir "$expected_owner_root"; then
       isolated_app_error "could not retire empty isolated owner root: $expected_owner_root"
       return 1
@@ -2478,6 +2495,7 @@ isolated_app_cleanup_manifest() {
     "$reservation_partial" "reservation manifest partial" || return 1
   isolated_app_remove_exact_path "$final_partial" "final manifest partial" || return 1
   isolated_app_remove_exact_path "$manifest" "isolated identity manifest" || return 1
+  isolated_app_remove_owner_finder_metadata "$expected_owner_root" || return 1
   if ! /bin/rmdir "$expected_owner_root"; then
     isolated_app_error "could not retire empty isolated owner root: $expected_owner_root"
     return 1

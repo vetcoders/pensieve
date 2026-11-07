@@ -126,12 +126,26 @@ enum VibecraftedMCPLocator {
 
 /// The wire the typed client speaks. Tests inject a fake; production speaks
 /// stdio JSON-RPC to `vibecrafted-mcp`.
+enum VibecraftedMCPValue: Equatable, Sendable, ExpressibleByStringLiteral {
+  case string(String)
+  case bool(Bool)
+
+  init(stringLiteral value: String) { self = .string(value) }
+
+  var jsonValue: Any {
+    switch self {
+    case .string(let value): return value
+    case .bool(let value): return value
+    }
+  }
+}
+
 protocol VibecraftedMCPTransporting: Sendable {
   func probe(commandPath: String) -> VibecraftedMCPConnectionStatus
   func callTool(
     commandPath: String,
     name: String,
-    arguments: [String: String]
+    arguments: [String: VibecraftedMCPValue]
   ) throws -> [String: Any]
 }
 
@@ -170,7 +184,7 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
   func callTool(
     commandPath: String,
     name: String,
-    arguments: [String: String]
+    arguments: [String: VibecraftedMCPValue]
   ) throws -> [String: Any] {
     guard FileManager.default.isExecutableFile(atPath: commandPath) else {
       throw AgentPromptLauncherError.mcpNotReady(.unreachable)
@@ -200,17 +214,76 @@ struct StdioVibecraftedMCPTransport: VibecraftedMCPTransporting {
         "method": "notifications/initialized",
       ])
 
+    var nextRequestID = 2
+    let overrides = ["model", "worktree"].filter { arguments[$0] != nil }
+    if !overrides.isEmpty {
+      // CLI capabilities and the connected MCP server can be different
+      // generations. An older server must never silently discard selections.
+      var matchedTool: [String: Any]?
+      var cursor: String?
+      var seenCursors = Set<String>()
+      while matchedTool == nil {
+        let listRequestID = nextRequestID
+        nextRequestID += 1
+        var params: [String: String] = [:]
+        if let cursor {
+          params["cursor"] = cursor
+        }
+        try connection.write(
+          ["jsonrpc": "2.0", "id": listRequestID, "method": "tools/list", "params": params])
+        let listing = try connection.readResponse(id: listRequestID)
+        if listing["error"] != nil {
+          return Self.toolPayload(from: listing)
+        }
+        let result = listing["result"] as? [String: Any]
+        let tools = result?["tools"] as? [[String: Any]] ?? []
+        if let found = tools.first(where: { $0["name"] as? String == name }) {
+          matchedTool = found
+          break
+        }
+        guard
+          let nextCursor = (result?["nextCursor"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !nextCursor.isEmpty,
+          seenCursors.insert(nextCursor).inserted
+        else {
+          break
+        }
+        cursor = nextCursor
+      }
+      let schema = matchedTool?["inputSchema"] as? [String: Any]
+      let properties = schema?["properties"] as? [String: Any] ?? [:]
+      func declares(_ raw: Any?, type: String) -> Bool {
+        guard let field = raw as? [String: Any] else { return false }
+        if field["type"] as? String == type { return true }
+        if let types = field["type"] as? [String], types.contains(type) { return true }
+        let alternatives = (field["anyOf"] ?? field["oneOf"]) as? [[String: Any]] ?? []
+        return alternatives.contains { declares($0, type: type) }
+      }
+      let missing = overrides.filter {
+        !declares(properties[$0], type: $0 == "worktree" ? "boolean" : "string")
+      }
+      guard missing.isEmpty else {
+        return [
+          "ok": false, "status": "refused",
+          "error": "The connected vibecrafted-mcp does not advertise "
+            + missing.joined(separator: ", ")
+            + ". Update that server before dispatching these selections.",
+        ]
+      }
+    }
+    let toolCallID = nextRequestID
     try connection.write(
       [
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": toolCallID,
         "method": "tools/call",
         "params": [
           "name": name,
-          "arguments": arguments,
+          "arguments": arguments.mapValues(\.jsonValue),
         ],
       ])
-    let response = try connection.readResponse(id: 2)
+    let response = try connection.readResponse(id: toolCallID)
     return Self.toolPayload(from: response)
   }
 
@@ -488,26 +561,29 @@ final class VibecraftedMCPClient: Sendable {
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions = AgentDispatchOptions()
   ) throws -> AgentDispatchMetadata {
     let current = refreshStatus()
     guard current == .connected, let commandPath = resolvedCommandPath() else {
       throw AgentPromptLauncherError.mcpNotReady(current)
     }
-    var arguments: [String: String] = [
-      "skill": workflow,
+    var arguments: [String: VibecraftedMCPValue] = [
+      "skill": .string(workflow),
       "runtime": "headless",
-      "root": workingDirectoryURL.path,
-      "source_dir": workingDirectoryURL.path,
+      "root": .string(workingDirectoryURL.path),
+      "source_dir": .string(workingDirectoryURL.path),
     ]
     if let agent = agents.first, !agent.isEmpty {
-      arguments["agent"] = agent
+      arguments["agent"] = .string(agent)
     }
+    if let model = options.selectedModel { arguments["model"] = .string(model) }
+    if let worktree = options.worktree { arguments["worktree"] = .bool(worktree) }
     switch payload {
     case .prompt(let prompt):
-      arguments["prompt"] = prompt
+      arguments["prompt"] = .string(prompt)
     case .file(let path):
-      arguments["file"] = path
+      arguments["file"] = .string(path)
     }
     let payloadJSON = try transport.callTool(
       commandPath: commandPath,

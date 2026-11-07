@@ -194,7 +194,7 @@ final class DispatchRootPersistenceTests: XCTestCase {
     XCTAssertEqual(runID, "dispatch-root-mcp")
     XCTAssertEqual(
       transport.toolCalls().first?.arguments["root"],
-      injectedRoot.standardizedFileURL.path)
+      .string(injectedRoot.standardizedFileURL.path))
   }
 
   private func makeDefaults() throws -> UserDefaults {
@@ -230,7 +230,8 @@ private final class DispatchRootRecordingLauncher: AgentPromptLaunching, Sendabl
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata {
     state.withLock { state in
       state.directories.append(workingDirectoryURL.standardizedFileURL)

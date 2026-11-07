@@ -155,7 +155,7 @@ final class AppController: ObservableObject {
   /// One close question at a time per window — a second ⌘W while the sheet is
   /// up must not stack another sheet on the same document.
   private var isConfirmingClose = false
-  let agentWorkflows: [String] = [
+  @Published private(set) var agentWorkflows: [String] = [
     "audit", "decorate", "delegate", "dou", "followup", "hydrate", "implement", "intents",
     "justdo", "marbles", "ownership", "partner", "polarize", "prune", "release", "research",
     "review", "scaffold", "workflow",
@@ -395,7 +395,7 @@ final class AppController: ObservableObject {
     // one document and may rebuild workspace configuration, but it does not
     // reopen the previous working set.
     if intent == .newUntitledTab {
-      folderManager.restoreLastFolderInBackground(into: appState)
+      folderManager.restoreLastFolderInBackgroundIfNeeded(into: appState)
       // Idempotent: the window's construction already seeded this draft (see
       // `NewTabSessionSeed`), so this is the fallback for a controller that
       // never went through a factory window — and, just as importantly, the
@@ -422,7 +422,11 @@ final class AppController: ObservableObject {
     // gated on it at all. Persisted bookmarks are untouched on every path.
     let reopensWorkingSet = intent != .coldLaunch || launchSettings.restoreSessionOnLaunch
 
-    folderManager.restoreLastFolderInBackground(into: appState)
+    if isApplicationStartupRestore || intent == .coldLaunch {
+      folderManager.restoreLastFolderInBackground(into: appState)
+    } else {
+      folderManager.restoreLastFolderInBackgroundIfNeeded(into: appState)
+    }
     // The claim above is taken FIRST on purpose, and the reopen is gated on it
     // rather than on the intent: a cold launch that declines the working set is
     // still the application's one startup restore, so the launcher that appears
@@ -1913,7 +1917,8 @@ final class AppController: ObservableObject {
           workflow: workflow,
           agents: [agent],
           payload: payload,
-          workingDirectoryURL: workingDirectoryURL
+          workingDirectoryURL: workingDirectoryURL,
+          options: AgentDispatchOptions()
         )
         await self?.completeAgentDispatch(
           metadata: metadata,
@@ -2006,6 +2011,7 @@ final class AppController: ObservableObject {
         case .success(let capabilities):
           self.workflowCapabilitiesState = .loaded(capabilities)
           self.adoptCapabilityAgentUniverse(capabilities.agents)
+          self.agentWorkflows = capabilities.workflows.map(\.name)
         case .failure(let error):
           self.workflowCapabilitiesState = .failed(error.localizedDescription)
         }
@@ -2095,6 +2101,7 @@ final class AppController: ObservableObject {
     workflow: String,
     agents: [String],
     rootURL: URL,
+    options: AgentDispatchOptions = AgentDispatchOptions(),
     allowsExternalDispatch: Bool = SandboxCapabilities.allowsExternalAgentDispatch()
   ) async -> DocumentDispatchOutcome {
     guard allowsExternalDispatch else {
@@ -2103,6 +2110,9 @@ final class AppController: ObservableObject {
     let payload = intent.payload
     guard !payload.isEmpty else {
       return .failure(message: "There is nothing to dispatch — the document is empty.")
+    }
+    if let reason = dispatchOptionsError(options, workflow: workflow, agents: agents) {
+      return .failure(message: reason)
     }
     // Capability gate: the launch must be a shape the workflow's descriptor
     // sanctions. A single-agent workflow launches with exactly one agent; a
@@ -2144,7 +2154,7 @@ final class AppController: ObservableObject {
       let metadata = try await Task.detached(priority: .userInitiated) {
         try launcher.dispatch(
           workflow: workflow, agents: agents,
-          payload: payload, workingDirectoryURL: rootURL)
+          payload: payload, workingDirectoryURL: rootURL, options: options)
       }.value
       // The receipt's `agent:` token is authoritative. Older/trimmed receipts
       // may omit it; only an explicitly dispatched positional agent is a safe
@@ -2201,6 +2211,26 @@ final class AppController: ObservableObject {
       transcriptionService.updateDispatchStatus(message)
       return .failure(message: message)
     }
+  }
+
+  /// Recheck optional selections at confirmation; a refreshed capability set
+  /// cannot silently downgrade the model or execution environment in the UI.
+  func dispatchOptionsError(
+    _ options: AgentDispatchOptions, workflow: String, agents: [String]
+  ) -> String? {
+    guard options.selectedModel != nil || options.worktree != nil else { return nil }
+    guard case .loaded(let capabilities) = workflowCapabilitiesState else {
+      return "Refresh workflow capabilities before choosing a model or execution environment."
+    }
+    if options.selectedModel != nil {
+      guard case .singleAgent = dispatchPlan(for: workflow), agents.count == 1,
+        capabilities.supportsModelOverride(agent: agents[0])
+      else { return "This workflow or agent does not support a model override." }
+    }
+    if let worktree = options.worktree, !capabilities.supportsWorktreeOverride(worktree) {
+      return "The selected execution environment is unavailable for this workflow launcher."
+    }
+    return nil
   }
 
   /// Best-effort: open Terminal tailing a launched run via the receipt's

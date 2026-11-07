@@ -188,12 +188,13 @@ final class FolderManager {
   /// ownership of the activity display (it bumped the generation before cancelling this
   /// task), and when there is nothing to clear. This is the ONLY clear point for the
   /// background path, so every early `return` in the build task tears the spinner down.
-  private func finishOpenFlow(generation: UInt64, into appState: AppState) {
+  private func finishOpenFlow(generation: UInt64, into appState: AppState?) {
     guard generation == openFlowGeneration else { return }
+    workspaceBuildTask = nil
     // A completed value-returning task still owns its full scan result.
     // Only this generation may release the current cancellation handle.
     workspaceValidationTask = nil
-    guard appState.workspaceActivity != nil else { return }
+    guard let appState, appState.workspaceActivity != nil else { return }
     setOpenActivity(nil, into: appState)
   }
 
@@ -627,6 +628,18 @@ final class FolderManager {
 
     openResolvedWorkspaceInBackground(
       rootURLs: restored.rootURLs, fileURLs: restored.fileURLs, into: appState)
+  }
+
+  /// Rebuilds the persisted workspace for a mid-session launcher or new tab ONLY
+  /// when `appState` does not already hold (or build) a workspace tree. All tabs
+  /// in a running process share one `WorkspaceStore`, so an unconditional restore
+  /// on every `⌘T` / Dock reopen would cancel an in-flight build or re-walk a
+  /// workspace tree that is already live and watched.
+  func restoreLastFolderInBackgroundIfNeeded(into appState: AppState) {
+    if workspaceBuildTask != nil || !appState.workspaceTree.isEmpty {
+      return
+    }
+    restoreLastFolderInBackground(into: appState)
   }
 
   func waitForPendingWorkspaceBuild() async {
@@ -1431,6 +1444,7 @@ final class FolderManager {
   ///   Only `removeRoot`'s last-root path does this.
   func closeWorkspace(into appState: AppState, deferringIndexMaintenance: Bool = false) {
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     // Take ownership of the activity display so the cancelled build's terminal clear
@@ -1487,6 +1501,7 @@ final class FolderManager {
   ) {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     openFlowGeneration &+= 1
@@ -1695,6 +1710,7 @@ final class FolderManager {
   ) {
     let rootURLs = uniqueRoots(requestedRootURLs)
     workspaceBuildTask?.cancel()
+    workspaceBuildTask = nil
     workspaceValidationTask?.cancel()
     workspaceValidationTask = nil
     openFlowGeneration &+= 1
@@ -1768,13 +1784,14 @@ final class FolderManager {
     workspaceValidationTask = validationTask
 
     workspaceBuildTask = Task { [weak self, weak appState] in
-      guard let self, let appState else { return }
+      guard let self else { return }
       // EVERY exit from this task — cancellation guard, workspace mismatch, or the
       // normal tail — must tear the `.opening`/`.indexing` presentation down, unless a
       // newer open flow already owns the display. A bare `return` here used to leave
       // the "Opening Workspace" spinner on screen forever (e.g. an ad-hoc file opened
       // mid-walk fails the workspace match; `applyRefresh` cancels the build outright).
       defer { self.finishOpenFlow(generation: generation, into: appState) }
+      guard let appState else { return }
       let validation: WorkspaceValidationResult
       do {
         validation = try await withTaskCancellationHandler {
@@ -2188,14 +2205,20 @@ final class FolderManager {
     entries.reserveCapacity(documents.count)
     for document in documents {
       guard !Task.isCancelled else { return nil }
-      guard
-        let values = try? document.url.resourceValues(forKeys: [
-          .contentModificationDateKey, .fileSizeKey,
-        ])
-      else { return nil }
-      let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
-      let size = values.fileSize ?? 0
-      entries[document.url.standardizedFileURL.path] = FileSignature(mtime: mtime, size: size)
+      let fileSignature: (path: String, sig: FileSignature)? = autoreleasepool {
+        var url = document.url.standardizedFileURL
+        defer { url.removeAllCachedResourceValues() }
+        guard
+          let values = try? url.resourceValues(forKeys: [
+            .contentModificationDateKey, .fileSizeKey,
+          ])
+        else { return nil }
+        let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let size = values.fileSize ?? 0
+        return (url.path, FileSignature(mtime: mtime, size: size))
+      }
+      guard let fileSignature else { return nil }
+      entries[fileSignature.path] = fileSignature.sig
     }
     return WorkspaceSignature(entries: entries)
   }
@@ -2706,6 +2729,7 @@ private enum WorkspaceDefaults {
     "dist",
     "DerivedData",
     "target",
+    "worktrees",
   ]
 }
 
@@ -2914,11 +2938,31 @@ enum WorkspaceScanner {
   ) throws -> [WorkspaceScan] {
     var scans: [WorkspaceScan] = []
     scans.reserveCapacity(rootURLs.count)
+    var uniqueRootURLs: [URL] = []
+    uniqueRootURLs.reserveCapacity(rootURLs.count)
     var scannedRoots: Set<String> = []
     for rootURL in rootURLs {
-      try cancellationCheck()
       guard scannedRoots.insert(BookmarkStore.rootIdentityPath(rootURL)).inserted else { continue }
-      let rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
+      uniqueRootURLs.append(rootURL)
+    }
+    let standardizedRoots = uniqueRootURLs.map(\.standardizedFileURL)
+    for (index, rootURL) in uniqueRootURLs.enumerated() {
+      try cancellationCheck()
+      let stdRoot = standardizedRoots[index]
+      var rootExclusions = WorkspaceExclusion.relativePaths(for: rootURL, from: exclusions)
+      // When a workspace contains nested roots (e.g. ~/.vibecrafted and
+      // ~/.vibecrafted/artifacts), the child root owns its subtree and walks it
+      // once as its own root scan; exclude that subtree from the ancestor root's
+      // traversal so files are never walked, listed, or indexed twice.
+      for (otherIndex, otherStdRoot) in standardizedRoots.enumerated()
+      where otherIndex != index && otherStdRoot.path != stdRoot.path
+        && contains(otherStdRoot, in: stdRoot)
+      {
+        let nestedRelPath = relativePath(for: otherStdRoot, root: stdRoot)
+        if !nestedRelPath.isEmpty {
+          rootExclusions.insert(nestedRelPath)
+        }
+      }
       scans.append(
         try scan(
           folder: rootURL,
@@ -3143,8 +3187,9 @@ enum WorkspaceScanner {
   )
     -> WorkspaceDirectoryEntry?
   {
-    let standardizedURL = url.standardizedFileURL
+    var standardizedURL = url.standardizedFileURL
     guard contains(standardizedURL, in: root) else { return nil }
+    defer { standardizedURL.removeAllCachedResourceValues() }
 
     // Classify the link itself before asking Foundation whether its target is a directory/file.
     // Symlinked folders/files are excluded wholesale: no external targets, no self-cycle edges.
@@ -3171,8 +3216,9 @@ enum WorkspaceScanner {
       return nil
     }
 
+    let cleanURL = URL(fileURLWithPath: standardizedURL.path, isDirectory: isDirectory)
     return WorkspaceDirectoryEntry(
-      url: standardizedURL,
+      url: cleanURL,
       relativePath: relativePath,
       isDirectory: isDirectory,
       isRegularFile: isRegularFile

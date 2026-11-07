@@ -696,6 +696,7 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, Sendable
     let agents: [String]
     let payload: AgentDispatchPayload
     let workingDirectoryURL: URL
+    var options = AgentDispatchOptions()
   }
 
   private struct State: Sendable {
@@ -719,7 +720,8 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, Sendable
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata {
     state.withLock { state in
       state.recordedRequests.append(
@@ -727,7 +729,7 @@ private final class RecordingAgentPromptLauncher: AgentPromptLaunching, Sendable
           workflow: workflow,
           agents: agents,
           payload: payload,
-          workingDirectoryURL: workingDirectoryURL.standardizedFileURL))
+          workingDirectoryURL: workingDirectoryURL.standardizedFileURL, options: options))
     }
     return result
   }

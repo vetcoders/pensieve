@@ -841,6 +841,21 @@ enum WindowChromeRecipe {
     let clipped = visible.intersection(content)
     return clipped.isEmpty ? visible : clipped
   }
+
+  /// True when `window` belongs to a multi-window `NSWindowTabGroup` and is not
+  /// the currently selected tab. Unselected background tabs do not display
+  /// their toolbar, tab-bar accessory, or preview on screen, so per-update
+  /// chrome walks and active WebKit layer-tree display links must skip them.
+  static func isUnselectedTabWindow(_ window: NSWindow?) -> Bool {
+    guard let window,
+      let tabGroup = window.tabGroup,
+      tabGroup.windows.count > 1,
+      let selectedWindow = tabGroup.selectedWindow
+    else {
+      return false
+    }
+    return selectedWindow !== window
+  }
 }
 
 extension View {
@@ -1003,6 +1018,7 @@ struct WindowChromeSink: NSViewRepresentable {
       ) { [weak self] _ in
         MainActor.assumeIsolated {
           guard let self, let window = self.window else { return }
+          guard !WindowChromeRecipe.isUnselectedTabWindow(window) else { return }
           // Cheap polarity gate before the chip/tab walk. A window still on
           // the outgoing half after a live flip must not be painted from this
           // notification — `assertBetweenPassChrome` repeats the same guard,
@@ -1102,7 +1118,10 @@ struct SidebarChromeInsetSink: NSViewRepresentable {
           observer = NotificationCenter.default.addObserver(
             forName: NSWindow.didUpdateNotification, object: window, queue: .main
           ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.report() }
+            MainActor.assumeIsolated {
+              guard let self, !WindowChromeRecipe.isUnselectedTabWindow(self.window) else { return }
+              self.report()
+            }
           }
         }
       }

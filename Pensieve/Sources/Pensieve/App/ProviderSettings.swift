@@ -234,6 +234,9 @@ final class ProviderSettings: ObservableObject {
   private let defaults: UserDefaults
   private let keychain: ProviderAPIKeyStoring
   private let environment: ProviderEnvironmentManaging
+  private let oauthTokenStore: any OAuthAccountTokenStoring
+  private let defaultFallbackChainEnabled: Bool
+  private let allowSharedAccountFallback: Bool
   private let modelDiscovery: ProviderModelDiscovering
   private var managedEnvironmentKeys: Set<String> = []
   private var discoveryGeneration: UInt64 = 0
@@ -245,11 +248,17 @@ final class ProviderSettings: ObservableObject {
     defaults: UserDefaults = .standard,
     keychain: ProviderAPIKeyStoring = KeychainProviderAPIKeyStore(),
     environment: ProviderEnvironmentManaging = ProcessProviderEnvironment(),
+    oauthTokenStore: (any OAuthAccountTokenStoring)? = nil,
+    defaultFallbackChainEnabled: Bool = false,
+    allowSharedAccountFallback: Bool = !AppSupportLocation.isRunningTests(),
     modelDiscovery: ProviderModelDiscovering? = nil
   ) {
     self.defaults = defaults
     self.keychain = keychain
     self.environment = environment
+    self.oauthTokenStore = oauthTokenStore ?? KeychainOAuthAccountTokenStore()
+    self.defaultFallbackChainEnabled = defaultFallbackChainEnabled
+    self.allowSharedAccountFallback = allowSharedAccountFallback
     self.modelDiscovery = modelDiscovery ?? ProviderModelDiscovery(defaults: defaults)
     let persistedShape =
       CompletionProviderShape(
@@ -274,11 +283,45 @@ final class ProviderSettings: ObservableObject {
     }
   }
 
-  /// The kernel requires endpoint + model, but intentionally permits an empty
-  /// API key for local/keyless OpenAI-compatible endpoints.
+  var isOAuthAccountSignedIn: Bool {
+    if OAuthAccountRuntime.hasSignedInAccount(in: environment, tokenStore: oauthTokenStore) {
+      return true
+    }
+    if allowSharedAccountFallback {
+      return GrokAccount.shared.snapshot.isSignedIn || CodexAccount.shared.snapshot.isSignedIn
+    }
+    return false
+  }
+
+  var activeOAuthProviderDisplayName: String? {
+    guard !GrokAccount.apiKeyLaneIsPinned(defaults) else { return nil }
+    for provider in OAuthAccountRuntime.orderedProviders(in: environment, defaults: defaults) {
+      if let tokens = oauthTokenStore.loadTokens(for: provider, environment: environment),
+        tokens.hasUsableCredentials
+      {
+        return provider.displayName
+      }
+    }
+    if allowSharedAccountFallback {
+      if GrokAccount.shared.snapshot.askUsesGrok || GrokAccount.shared.snapshot.isSignedIn {
+        return OAuthAccountProvider.xAIResponses.displayName
+      }
+      if CodexAccount.shared.snapshot.askUsesCodex || CodexAccount.shared.snapshot.isSignedIn {
+        return OAuthAccountProvider.openAIResponses.displayName
+      }
+    }
+    return nil
+  }
+
+  /// Autocomplete is configured when an explicit endpoint + model are set,
+  /// when an OAuth account is signed in (Tier 1), or when the Libraxis/OpenRouter
+  /// fallback chain (Tier 2/3) is explicitly opted in.
   var isConfigured: Bool {
-    Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
-      && Self.hasNonEmptyValue(in: Self.modelEnvironmentKeys, environment: environment)
+    (Self.hasNonEmptyValue(in: Self.endpointEnvironmentKeys, environment: environment)
+      && Self.hasNonEmptyValue(in: Self.modelEnvironmentKeys, environment: environment))
+      || isOAuthAccountSignedIn
+      || AIProviderRuntime.hasFallbackChainEnvironment(in: environment)
+      || defaultFallbackChainEnabled
   }
 
   var isDraftValid: Bool {
@@ -523,13 +566,41 @@ final class ProviderSettings: ObservableObject {
     return base + "/v1/messages"
   }
 
+  nonisolated static func firstNonEmptyValue(
+    for keys: [String],
+    in environment: any ProviderEnvironmentManaging
+  ) -> String? {
+    for key in keys {
+      guard
+        let value = environment.value(forKey: key)?.trimmingCharacters(
+          in: .whitespacesAndNewlines),
+        !value.isEmpty
+      else { continue }
+      return value
+    }
+    return nil
+  }
+
+  nonisolated static func providerShape(
+    in environment: any ProviderEnvironmentManaging,
+    endpoint: String
+  ) -> CompletionProviderShape {
+    if let explicit = firstNonEmptyValue(for: providerShapeEnvironmentKeys, in: environment),
+      let shape = CompletionProviderShape(rawValue: explicit)
+    {
+      return shape
+    }
+    let lowercased = endpoint.lowercased()
+    if lowercased.contains("api.anthropic.com") || lowercased.hasSuffix("/v1/messages") {
+      return .anthropicMessages
+    }
+    return .openAIResponses
+  }
+
   private static func hasNonEmptyValue(
     in keys: [String],
     environment: ProviderEnvironmentManaging
   ) -> Bool {
-    keys.contains { key in
-      guard let value = environment.value(forKey: key) else { return false }
-      return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+    firstNonEmptyValue(for: keys, in: environment) != nil
   }
 }

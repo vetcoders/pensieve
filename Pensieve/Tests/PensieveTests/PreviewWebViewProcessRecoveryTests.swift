@@ -271,4 +271,98 @@ final class PreviewWebViewProcessRecoveryTests: XCTestCase {
       fullLoads.last, secondEdit,
       "fallback must reload the newest content, not the failed snapshot")
   }
+
+  @MainActor
+  func testUnselectedTabDefersLoadsAndBackgroundTerminationUntilSelected() {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var fullLoads: [PreviewDocument] = []
+    view.fullPageLoadObserver = { fullLoads.append($0) }
+
+    view.unselectedTabWindowOverride = true
+    view.syncWebViewVisibility()
+
+    let initial = makeDocument(body: "<p>tab-1</p>")
+    let updated = makeDocument(body: "<p>tab-2</p>")
+    view.load(document: initial)
+    view.load(document: updated)
+    XCTAssertTrue(
+      fullLoads.isEmpty,
+      "unselected background tabs must defer WebKit HTML loads until selected")
+
+    // Process terminations while unselected must not reload in the background
+    // or consume the automatic recovery budget.
+    for _ in 0..<5 {
+      view.handleWebContentProcessTermination()
+    }
+    XCTAssertFalse(view.isRecoveryPaused)
+    XCTAssertTrue(fullLoads.isEmpty)
+
+    // Selecting the tab flushes the newest deferred document exactly once.
+    view.unselectedTabWindowOverride = false
+    view.syncWebViewVisibility()
+    XCTAssertEqual(fullLoads, [updated])
+  }
+
+  @MainActor
+  func testUnselectedTabDetachesAndReattachesLiveWebView() {
+    let view = PreviewWebView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+    let webView = view.subviews.compactMap { $0 as? WKWebView }.first
+    XCTAssertNotNil(webView)
+    XCTAssertTrue(webView?.superview === view)
+
+    view.unselectedTabWindowOverride = true
+    view.syncWebViewVisibility()
+    XCTAssertNil(
+      webView?.superview,
+      "unselected tab must detach WKWebView from superview so Auto Layout setFrame and display links stop"
+    )
+    XCTAssertEqual(webView?.isHidden, true)
+
+    view.unselectedTabWindowOverride = false
+    view.syncWebViewVisibility()
+    XCTAssertTrue(webView?.superview === view)
+    XCTAssertEqual(webView?.isHidden, false)
+  }
+
+  @MainActor
+  func testInFlightUpdateCompletingAfterTabBecomesUnselectedDoesNotEvaluateSuccessorUntilSelected()
+  {
+    let view = PreviewWebView(frame: .zero, createsWebContent: false)
+    var evaluatedScripts: [String] = []
+    var pendingCompletion: ((Any?, Error?) -> Void)?
+    view.updateScriptEvaluator = { script, completion in
+      evaluatedScripts.append(script)
+      pendingCompletion = completion
+    }
+
+    let doc1 = makeDocument(body: "<p>v1</p>")
+    let doc2 = makeDocument(body: "<p>v2</p>")
+    let doc3 = makeDocument(body: "<p>v3</p>")
+    view.load(document: doc1)
+    view.load(document: doc2)
+    XCTAssertEqual(evaluatedScripts.count, 1)
+
+    // Tab becomes unselected while the in-place update for doc2 is still in flight,
+    // and a newer edit (doc3) arrives while unselected.
+    view.unselectedTabWindowOverride = true
+    view.syncWebViewVisibility()
+    view.load(document: doc3)
+
+    // Late completion of doc2's in-place update must NOT evaluate doc3 while unselected.
+    pendingCompletion?(true, nil)
+    XCTAssertEqual(
+      evaluatedScripts.count, 1,
+      "completing an in-flight update after a tab becomes unselected must not evaluate JS in the background"
+    )
+
+    // Also pin direct handleUpdateScriptResult when unselected without generation.
+    view.handleUpdateScriptResult(true, error: nil, for: doc2)
+    XCTAssertEqual(evaluatedScripts.count, 1)
+
+    // Re-selecting the tab flushes the deferred update for doc3.
+    view.unselectedTabWindowOverride = false
+    view.syncWebViewVisibility()
+    XCTAssertEqual(evaluatedScripts.count, 2)
+    XCTAssertTrue(evaluatedScripts[1].contains("v3"))
+  }
 }

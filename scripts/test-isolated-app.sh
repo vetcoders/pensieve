@@ -1097,6 +1097,17 @@ run_certless_cleanup_tests() {
   [[ -e "$reservation_manifest" && -e "$owner_unknown" ]] \
     || fail "unknown-child rejection retired cleanup authority or foreign bytes"
   /bin/rm -- "$owner_unknown"
+  owner_finder="$reservation_owner/.DS_Store"
+  /bin/mkdir "$owner_finder"
+  if isolated_app_cleanup_manifest "$reservation_manifest" "$reservation_owner" \
+    >/dev/null 2>&1; then
+    fail "manifested cleanup accepted a directory named like Finder metadata"
+  fi
+  [[ -e "$reservation_manifest" && -d "$owner_finder" ]] \
+    || fail "Finder-named directory rejection retired cleanup authority or its bytes"
+  /bin/rmdir -- "$owner_finder"
+  # Finder may write view state into the capsule while a run is in flight.
+  printf 'finder view state\n' >"$owner_finder"
   isolated_app_cleanup_manifest "$reservation_manifest" "$reservation_owner" \
     || fail "valid reservation cleanup failed"
   reservation_partial="$(isolated_app_manifest_partial_path \
@@ -1122,6 +1133,7 @@ run_certless_cleanup_tests() {
   [[ -e "$interrupted_partial" && -e "$interrupted_unknown" ]] \
     || fail "missing-manifest census mutated bytes before rejecting an unknown child"
   /bin/rm -- "$interrupted_unknown"
+  printf 'finder view state\n' >"$interrupted_owner/.DS_Store"
   isolated_app_cleanup_manifest "$interrupted_manifest" "$interrupted_owner" \
     || fail "cleanup could not retire a lone interrupted reservation temporary"
   [[ ! -e "$interrupted_owner" && ! -e "$interrupted_partial" ]] \

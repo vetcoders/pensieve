@@ -107,9 +107,11 @@ finding, add it there with a reason — do not sprinkle inline ignores.
 ## Release
 
 ```bash
-make release            # signed + notarized .app + .dmg (Developer ID)
-make release-appstore   # sandbox-signed .app + .pkg (Mac App Store)
-make install-app        # local install into /Applications
+make release-prepare VERSION=patch  # bump VERSION + sync docs/index.html + close CHANGELOG.md
+make release                        # local signed + notarized .app + .dmg (publishes nothing)
+make publish                        # stamp docs/index.html + GitHub Release (--latest) + internal shelf
+make release-appstore               # sandbox-signed .app + .pkg (Mac App Store)
+make install-app                    # local install into /Applications
 ```
 
 Both release lanes are gated by `make gates`. The App Store lane has its own
@@ -172,11 +174,10 @@ and never let a test reach a real keychain — `scripts/test-build-keychain.sh`
 shims `security` and `launchctl` on `PATH` and asserts the absence of that call
 in the sessions that could pop a panel.
 
-**The download page's checksum is stamped, not typed.** A lane that produces a
-notarized DMG (`make release`, `make release-clean`, `make notarize`) rewrites
+**The download page's checksum is stamped, not typed.** The publishing lane (`make publish`, `scripts/build-release.sh --publish` / `--publish-only`) rewrites
 the single `class="sha"` slot in `docs/index.html` with the SHA-256 of the DMG
-it just built, then verifies it — so commit `docs/index.html` together with the
-release. Local lanes (`make release-local`, also with `NOTARIZE=true`,
+it just built or verified, then verifies it — so commit `docs/index.html` together with the
+release. Local lanes (`make release`, `make release-clean`, `make notarize`, `make release-local`, also with `NOTARIZE=true`,
 `make release-appstore`, any `--no-notarize` or `--no-publish` run) never touch
 or gate on the page, never create a GitHub release and never copy to the
 internal shelf: the repo deliberately

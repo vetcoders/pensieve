@@ -43,6 +43,7 @@ pre-push:
   commands:
     template:
       # Lefthook passes the same stdin (refs) that git provides for pre-push.
+      use_stdin: true
       run: bash .husky/pre-push
 
 # ---------------------------------------------------------------------------

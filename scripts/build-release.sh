@@ -16,13 +16,15 @@
 #                       latest, so releases/latest/download/Pensieve.dmg is this DMG)
 #
 # Usage:
-#   ./scripts/build-release.sh            # full pipeline
+#   ./scripts/build-release.sh                 # local signed + notarized .app + DMG (publishes nothing)
+#   ./scripts/build-release.sh --publish       # full pipeline + publish (docs/index.html + GitHub Release + shelf)
+#   ./scripts/build-release.sh --publish-only  # publish existing verified notarized .app + DMG for HEAD
 #   ./scripts/build-release.sh --no-notarize   # local-only signed build
-#   ./scripts/build-release.sh --no-publish    # notarized .app + DMG, nothing published
-#   ./scripts/build-release.sh --clean    # nuke dist/ first
-#   ./scripts/build-release.sh --dmg-only # only (re)build DMG from existing stapled .app
-#   ./scripts/build-release.sh --no-dmg   # build + sign the .app only, skip the DMG step
-#   ./scripts/build-release.sh --appstore # Mac App Store lane: sandbox-signed .app + .pkg
+#   ./scripts/build-release.sh --no-publish    # explicit local notarized .app + DMG (default)
+#   ./scripts/build-release.sh --clean         # nuke dist/ first
+#   ./scripts/build-release.sh --dmg-only      # only (re)build DMG from existing stapled .app
+#   ./scripts/build-release.sh --no-dmg        # build + sign the .app only, skip the DMG step
+#   ./scripts/build-release.sh --appstore      # Mac App Store lane: sandbox-signed .app + .pkg
 #
 # App Store lane (--appstore):
 #   Signs with Pensieve.mas.entitlements (App Sandbox) and packages a .pkg via
@@ -86,18 +88,21 @@ DO_NOTARIZE=1
 DO_CLEAN=0
 DMG_ONLY=0
 DO_DMG=1
-DO_PUBLISH=1
+DO_PUBLISH=0
+PUBLISH_ONLY=0
 APPSTORE=0
 for arg in "$@"; do
     case "$arg" in
-        --no-notarize) DO_NOTARIZE=0 ;;
-        --clean)       DO_CLEAN=1 ;;
-        --dmg-only)    DMG_ONLY=1 ;;
-        --no-dmg)      DO_DMG=0 ;;
-        --no-publish)  DO_PUBLISH=0 ;;
-        --appstore)    APPSTORE=1 ;;
+        --no-notarize)  DO_NOTARIZE=0 ;;
+        --clean)        DO_CLEAN=1 ;;
+        --dmg-only)     DMG_ONLY=1 ;;
+        --no-dmg)       DO_DMG=0 ;;
+        --publish)      DO_PUBLISH=1 ;;
+        --publish-only) DO_PUBLISH=1; PUBLISH_ONLY=1 ;;
+        --no-publish)   DO_PUBLISH=0; PUBLISH_ONLY=0 ;;
+        --appstore)     APPSTORE=1 ;;
         -h|--help)
-            head -48 "$0" | grep -E "^#" | sed 's/^# \?//'
+            head -50 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
@@ -108,6 +113,10 @@ if (( DMG_ONLY )) && (( ! DO_DMG )); then
 fi
 if (( APPSTORE )) && (( DMG_ONLY )); then
     echo "Args --appstore and --dmg-only are contradictory (MAS lane has no DMG)" >&2; exit 2
+fi
+if (( PUBLISH_ONLY )) && (( ! DO_DMG || ! DO_NOTARIZE || ! DO_PUBLISH || APPSTORE || DO_CLEAN || DMG_ONLY )); then
+    echo "Arg --publish-only cannot be combined with --no-dmg, --no-notarize, --no-publish, --appstore, --clean, or --dmg-only" >&2
+    exit 2
 fi
 if (( APPSTORE )); then
     # MAS lane: App Review replaces notarization; the product is a .pkg, not a DMG.
@@ -166,6 +175,27 @@ log()  { printf "\033[36m[build]\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m[ ok ]\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
+
+# Fail in preflight if a publishing run targets a commit that has not been
+# pushed to the GitHub remote yet. Otherwise `gh release create --target
+# "$COMMIT_FULL"` dies with `HTTP 422: Release.target_commitish is invalid`
+# AFTER building, notarizing, and stamping docs/index.html.
+assert_github_release_target_reachable() {
+    local repo
+    (( PUBLISHES_DMG )) || return 0
+    command -v gh >/dev/null 2>&1 \
+        || die "gh is required to publish the notarized DMG. Install GitHub CLI and authenticate it."
+    repo="$(printf '%s\n' "$LANDING_PAGE_ARTIFACT_URL" | sed -n \
+        's#^https://github.com/\([^/]*\)/\([^/]*\)/releases/latest/download/.*#\1/\2#p')"
+    [[ "$repo" == */* ]] \
+        || die "Cannot derive the GitHub repo from $LANDING_PAGE_ARTIFACT_URL"
+    if ! gh api "repos/${repo}/commits/${COMMIT_FULL}" --silent >/dev/null 2>&1; then
+        die "Commit $COMMIT_FULL ($COMMIT_SLUG) is not on GitHub ($repo) yet.
+       GitHub Releases rejects an unpushed target_commitish with HTTP 422.
+       Push your branch or tag to origin first (e.g. make release-push or git push origin HEAD),
+       or run 'make release' for a local notarized build without publishing."
+    fi
+}
 
 # Upload the stapled DMG to the GitHub Release the download page already
 # points at. The page's three artifact links are releases/latest/download/<dmg>,
@@ -576,12 +606,27 @@ log "FFI profile: $FFI_PROFILE"
 # artifact must cost a preflight failure, not a notarization round trip plus an
 # artifact already copied onto the team shelf.
 if (( PUBLISHES_DMG )); then
+    assert_github_release_target_reachable
+    ok "GitHub target commit reachable on origin: $COMMIT_SLUG"
     landing_page_assert_publishable "$LANDING_PAGE" "$APP_VERSION" "$LANDING_PAGE_ARTIFACT_URL" \
         || die "docs/index.html cannot carry this release's checksum (see above) — fix the download page before publishing."
     ok "Landing page ready for stamping: $LANDING_PAGE"
 fi
 
-if (( ! DMG_ONLY )); then
+# When `--publish` is run after `make release`, reuse the already-built,
+# provenance-verified, notarized, and stapled .app + DMG for this exact commit
+# instead of paying for a second compilation and Apple notarization round-trip.
+if (( PUBLISHES_DMG && ! PUBLISH_ONLY && ! DO_CLEAN && ! DMG_ONLY )) \
+    && [[ -d "$APP_BUNDLE" && -f "$DMG_PATH" ]] \
+    && bundle_identity_matches "$APP_BUNDLE" "$APP_VERSION" "$COMMIT_FULL" \
+    && codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1 \
+    && codesign --verify --verbose=2 "$DMG_PATH" >/dev/null 2>&1 \
+    && xcrun stapler validate "$APP_BUNDLE" >/dev/null 2>&1 \
+    && xcrun stapler validate "$DMG_PATH" >/dev/null 2>&1; then
+    PUBLISH_ONLY=1
+fi
+
+if (( ! DMG_ONLY && ! PUBLISH_ONLY )); then
     if (( DO_CLEAN )); then
         log "Cleaning $DIST_DIR + Pensieve/.build"
         build_provenance_cleanup_dist_directory "$DIST_DIR" \
@@ -609,21 +654,21 @@ if (( ! DMG_ONLY )); then
     BUILD_ENTITLEMENTS="$RELEASE_SNAPSHOT_ROOT/$ENTITLEMENTS_RELATIVE"
 fi
 
-if (( DMG_ONLY )); then
+if (( DMG_ONLY || PUBLISH_ONLY )); then
+    REUSE_FLAG="--dmg-only"
+    (( PUBLISH_ONLY )) && REUSE_FLAG="--publish-only"
     # Reuse an already-built, signed, notarized + stapled .app and only
-    # (re)build/sign/notarize/staple the DMG around it. Lets a disk-full or
-    # transient DMG failure be retried without re-running swift build and a
-    # second Apple notarization of the .app.
-    assert_release_head_unchanged "before --dmg-only source verification"
-    [[ -d "$APP_BUNDLE" ]] || die "--dmg-only: $APP_BUNDLE not found — run a full build first."
-    log "Materializing exact commit runtime inputs for --dmg-only"
+    # (re)build/sign/notarize/staple the DMG around it (or publish existing DMG).
+    assert_release_head_unchanged "before $REUSE_FLAG source verification"
+    [[ -d "$APP_BUNDLE" ]] || die "$REUSE_FLAG: $APP_BUNDLE not found — run 'make release' first."
+    log "Materializing exact commit runtime inputs for $REUSE_FLAG"
     PROVENANCE_VERIFICATION_INPUT_DIGEST="$(
         build_provenance_commit_runtime_input_digest \
             "$REPO_ROOT" "$COMMIT_FULL" release
-    )" || die "Could not derive --dmg-only provenance from the exact commit tree."
-    ok "DMG-only commit runtime input: $PROVENANCE_VERIFICATION_INPUT_DIGEST"
+    )" || die "Could not derive $REUSE_FLAG provenance from the exact commit tree."
+    ok "$REUSE_FLAG commit runtime input: $PROVENANCE_VERIFICATION_INPUT_DIGEST"
     if ! codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
-        die "--dmg-only: $APP_BUNDLE signature is invalid — rebuild it before packaging a DMG."
+        die "$REUSE_FLAG: $APP_BUNDLE signature is invalid — rebuild it before packaging or publishing."
     fi
     # A valid signature proves the bundle was not modified after signing. It is
     # NOT proof of identity: a perfectly signed .app from an older VERSION/HEAD
@@ -632,35 +677,31 @@ if (( DMG_ONLY )); then
     # advertise $BUILD_LABEL while shipping that older app. Compare the identity
     # stamped into the bundle at build time before reusing it.
     if ! bundle_identity_matches "$APP_BUNDLE" "$APP_VERSION" "$COMMIT_FULL"; then
-        die "--dmg-only: $APP_BUNDLE was built from a different source than this tree.
-       Packaging it would ship that older app under the label $BUILD_LABEL.
-       Run a full build first: make release-clean (or ./scripts/build-release.sh --clean)."
+        die "$REUSE_FLAG: $APP_BUNDLE was built from a different source than this tree.
+       Packaging or publishing it would ship that older app under the label $BUILD_LABEL.
+       Run a full build first: make release (or make release-clean)."
     fi
-    # The strip below lives in the build lane, which --dmg-only skips. A bundle
-    # produced by an older script (or by a hand-run swift build) therefore still
-    # carries the builder's absolute rpaths, and re-stripping here is not an
-    # option: install_name_tool would break the signature and the staple. Verify
-    # and refuse instead.
-    assert_app_rpath_hygiene "--dmg-only: $APP_BUNDLE still carries absolute LC_RPATH entries.
+    # The strip below lives in the build lane, which --dmg-only/--publish-only skips.
+    assert_app_rpath_hygiene "$REUSE_FLAG: $APP_BUNDLE still carries absolute LC_RPATH entries.
        They cannot be stripped from an already-signed bundle without invalidating
        its signature and notarization ticket. Rebuild it: make release-clean
        (or ./scripts/build-release.sh --clean)."
-    if ! verify_release_bundle_provenance "--dmg-only provenance verification"; then
-        die "--dmg-only: $APP_BUNDLE has missing, stale, or invalid build provenance.
+    if ! verify_release_bundle_provenance "$REUSE_FLAG provenance verification"; then
+        die "$REUSE_FLAG: $APP_BUNDLE has missing, stale, or invalid build provenance.
        A valid signature and Info.plist commit are not enough to prove which
        runtime inputs and Mach-O payloads are inside it. Run a full build first:
        make release-clean (or ./scripts/build-release.sh --clean)."
     fi
     if (( DO_NOTARIZE )) \
         && ! xcrun stapler validate "$APP_BUNDLE" >/dev/null 2>&1; then
-        die "--dmg-only: $APP_BUNDLE has no valid stapled notarization ticket.
+        die "$REUSE_FLAG: $APP_BUNDLE has no valid stapled notarization ticket.
        The notarized DMG lane only reuses a signed, notarized, and stapled app.
-       Run a full build first: make release-clean (or ./scripts/build-release.sh --clean)."
+       Run a full build first: make release (or make release-clean)."
     fi
-    ok "DMG-only: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, LC_RPATH clean, skipping build/sign/notarize-app)"
+    ok "$REUSE_FLAG: reusing existing signed .app at $APP_BUNDLE (identity $BUILD_LABEL verified, LC_RPATH clean, skipping build/sign/notarize-app)"
 fi
 
-if (( ! DMG_ONLY )); then
+if (( ! DMG_ONLY && ! PUBLISH_ONLY )); then
 
 # ─── Build ────────────────────────────────────────────────────────────────
 log "swift build -c release (arm64)"
@@ -695,6 +736,7 @@ ok "SwiftPM resources: $SPM_BUNDLE_DIR"
 
 # ─── Bundle into .app ─────────────────────────────────────────────────────
 log "Building $APP_NAME.app structure"
+rm -f "$DMG_PATH"
 build_provenance_cleanup_app_bundle "$APP_BUNDLE" \
     || die "Could not retire the previous $APP_NAME.app bundle safely."
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
@@ -971,6 +1013,14 @@ if (( ! DO_DMG )); then
         || die "Source or signed app drifted before local app completion."
     ok "Skipping DMG (--no-dmg): signed .app is ready at $APP_BUNDLE"
 else
+if (( PUBLISH_ONLY )); then
+    [[ -f "$DMG_PATH" ]] || die "--publish-only: $DMG_PATH not found — run 'make release' first."
+    codesign --verify --verbose=2 "$DMG_PATH" >/dev/null 2>&1 \
+        || die "--publish-only: $DMG_PATH signature is invalid — run 'make release' first."
+    xcrun stapler validate "$DMG_PATH" >/dev/null 2>&1 \
+        || die "--publish-only: $DMG_PATH has no valid stapled notarization ticket — run 'make release' first."
+    ok "Publish-only: reusing existing signed, notarized + stapled DMG at $DMG_PATH"
+else
 verify_release_bundle_provenance "DMG creation" \
     || die "Source or signed app drifted before DMG creation."
 log "Building DMG"
@@ -1042,6 +1092,7 @@ if (( DO_NOTARIZE )); then
         die "DMG notarization failed"
     fi
 fi
+fi  # end: skip DMG build/sign/notarize in --publish-only mode
 
 # Refresh the stable-named copy AFTER sign/notarize/staple: the staple ticket
 # lives inside the DMG, so the copy stays validated, and the fixed name keeps

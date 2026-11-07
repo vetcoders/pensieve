@@ -491,6 +491,10 @@ final class AppState {
     workspaceStore.sortedWorkspaceTree
   }
 
+  var sortedWorkspaceTreeRevision: UInt64 {
+    workspaceStore.sortedWorkspaceTreeRevision
+  }
+
   var hasWorkspaceContent: Bool {
     workspaceStore.hasWorkspaceContent
   }

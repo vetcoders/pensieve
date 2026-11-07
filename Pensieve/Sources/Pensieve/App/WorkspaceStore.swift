@@ -109,7 +109,10 @@ final class WorkspaceStore {
   /// flatten, so every hover/selection/render triggered a full O(n log n)
   /// recursive re-sort on the main thread (the sidebar "slow as hell" jank).
   /// Stored + eager-on-mutation keeps reads O(1) and stays @Observable-tracked.
-  private(set) var sortedWorkspaceTree: [WorkspaceNode] = []
+  private(set) var sortedWorkspaceTree: [WorkspaceNode] = [] {
+    didSet { sortedWorkspaceTreeRevision &+= 1 }
+  }
+  private(set) var sortedWorkspaceTreeRevision: UInt64 = 0
 
   var hasWorkspaceContent: Bool {
     !workspaceRoots.isEmpty || !openFiles.isEmpty
@@ -165,18 +168,36 @@ final class WorkspaceStore {
   }
 
   private func sortNodes(_ nodes: [WorkspaceNode]) -> [WorkspaceNode] {
-    guard sidebarSortOrder != .manual else { return nodes }
+    guard sidebarSortOrder != .manual, !nodes.isEmpty else { return nodes }
 
-    let sortedChildren =
-      nodes
-      .map { node in
-        var copy = node
-        copy.children = node.children.map(sortNodes)
-        return copy
+    var anyChildChanged = false
+    var updatedNodes: [WorkspaceNode] = []
+    for (index, node) in nodes.enumerated() {
+      if let children = node.children, !children.isEmpty {
+        let sortedChildren = sortNodes(children)
+        if sortedChildren != children {
+          if !anyChildChanged {
+            updatedNodes = Array(nodes.prefix(index))
+            updatedNodes.reserveCapacity(nodes.count)
+            anyChildChanged = true
+          }
+          var copy = node
+          copy.children = sortedChildren
+          updatedNodes.append(copy)
+          continue
+        }
       }
-    return sortedChildren.sorted { lhs, rhs in
-      compareWorkspaceNodes(lhs, rhs)
+      if anyChildChanged {
+        updatedNodes.append(node)
+      }
     }
+    let base = anyChildChanged ? updatedNodes : nodes
+    var isAlreadySorted = true
+    for i in 1..<base.count where compareWorkspaceNodes(base[i], base[i - 1]) {
+      isAlreadySorted = false
+      break
+    }
+    return isAlreadySorted ? base : base.sorted(by: compareWorkspaceNodes)
   }
 
   private func compareWorkspaceNodes(_ lhs: WorkspaceNode, _ rhs: WorkspaceNode) -> Bool {

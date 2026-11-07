@@ -921,7 +921,8 @@ private final class MockAgentPromptLauncher: AgentPromptLaunching, Sendable {
     self.result = result
   }
   func dispatch(
-    workflow: String, agents: [String], payload: AgentDispatchPayload, workingDirectoryURL: URL
+    workflow: String, agents: [String], payload: AgentDispatchPayload, workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata {
     state.withLock { state in
       if case .prompt(let prompt) = payload { state.prompts.append(prompt) }

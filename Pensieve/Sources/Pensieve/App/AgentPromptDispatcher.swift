@@ -192,6 +192,18 @@ struct AgentDispatchMetadata: Equatable, Sendable {
   }
 }
 
+struct AgentDispatchOptions: Equatable, Sendable {
+  var model: String? = nil
+  /// nil keeps the workflow default; false selects the working checkout;
+  /// true requests an isolated worktree through the canonical runtime.
+  var worktree: Bool? = nil
+
+  var selectedModel: String? {
+    let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
 protocol AgentPromptLaunching: Sendable {
   /// `agents` are the POSITIONAL agent tokens, in CLI order. One token is a
   /// single-agent (or synthesizer-override) run; an empty list launches the
@@ -201,7 +213,8 @@ protocol AgentPromptLaunching: Sendable {
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions
   ) throws -> AgentDispatchMetadata
 }
 
@@ -379,12 +392,14 @@ final class VibecraftedAgentPromptLauncher: AgentPromptLaunching, Sendable {
     workflow: String,
     agents: [String],
     payload: AgentDispatchPayload,
-    workingDirectoryURL: URL
+    workingDirectoryURL: URL,
+    options: AgentDispatchOptions = AgentDispatchOptions()
   ) throws -> AgentDispatchMetadata {
     try mcpClient.dispatch(
       workflow: workflow,
       agents: agents,
       payload: payload,
-      workingDirectoryURL: workingDirectoryURL)
+      workingDirectoryURL: workingDirectoryURL,
+      options: options)
   }
 }

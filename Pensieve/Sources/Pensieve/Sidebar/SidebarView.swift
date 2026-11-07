@@ -71,7 +71,7 @@ struct SidebarView: View {
     .onChange(of: rootNodeIDs) { _, _ in
       reconcileWorkspaceRootExpansion()
     }
-    .onChange(of: appState.sortedWorkspaceTree) { _, _ in
+    .onChange(of: appState.sortedWorkspaceTreeRevision) { _, _ in
       scheduleTreeSnapshot()
     }
     .onChange(of: expandedNodeIDs) { _, _ in

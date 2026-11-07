@@ -30,6 +30,8 @@ struct DispatchPopover: View {
   /// which launches with NO positional agent). Only offered when the
   /// descriptor declares the positional-synthesizer policy.
   @State private var synthesizer: String = ""
+  @State private var model: String = ""
+  @State private var environment: String = ""
 
   enum Phase: Equatable {
     case configuring
@@ -61,9 +63,10 @@ struct DispatchPopover: View {
   static func canConfirmDispatch(
     subjectIsEmpty: Bool,
     plan: WorkflowDispatchPlan,
-    mcpStatus: VibecraftedMCPConnectionStatus
+    mcpStatus: VibecraftedMCPConnectionStatus,
+    optionsSupported: Bool = true
   ) -> Bool {
-    !subjectIsEmpty && plan.isLaunchable(mcpStatus: mcpStatus)
+    !subjectIsEmpty && optionsSupported && plan.isLaunchable(mcpStatus: mcpStatus)
   }
 
   init(
@@ -148,6 +151,8 @@ struct DispatchPopover: View {
       .disabled(!isConfiguring)
       .accessibilityIdentifier("pensieve.dispatch.workflow")
 
+      launchOptionsSection
+
       Divider()
 
       VStack(alignment: .leading, spacing: 2) {
@@ -159,6 +164,14 @@ struct DispatchPopover: View {
           .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
         Text("where: \(rootURL.lastPathComponent)")
           .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+        if let model = dispatchOptions.selectedModel {
+          Text("model: \(model)")
+            .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+        }
+        if let selected = capabilities?.environments[environment] {
+          Text("environment: \(selected.label)")
+            .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+        }
       }
 
       Divider()
@@ -174,7 +187,72 @@ struct DispatchPopover: View {
       controller.refreshWorkflowCapabilities(force: true)
       mcpStatus = mcpClient.refreshStatus()
     }
-    .onChange(of: workflow) { synthesizer = "" }
+    .onChange(of: controller.agentWorkflows) { _, workflows in
+      if !workflows.contains(workflow), let first = workflows.first {
+        workflow = first
+      }
+    }
+    .onChange(of: workflow) {
+      synthesizer = ""
+      model = ""
+    }
+    .onChange(of: agent) { model = "" }
+  }
+
+  private var capabilities: WorkflowCapabilities? {
+    if case .loaded(let value) = controller.workflowCapabilitiesState { return value }
+    return nil
+  }
+
+  private var dispatchOptions: AgentDispatchOptions {
+    let worktree: Bool?
+    switch environment {
+    case "local-native": worktree = false
+    case "local-worktrees": worktree = true
+    default: worktree = nil
+    }
+    return AgentDispatchOptions(model: model, worktree: worktree)
+  }
+
+  private var optionsError: String? {
+    if !environment.isEmpty && dispatchOptions.worktree == nil {
+      return "This execution environment is not supported by this workflow launcher."
+    }
+    return controller.dispatchOptionsError(
+      dispatchOptions, workflow: workflow, agents: [agent])
+  }
+
+  @ViewBuilder private var launchOptionsSection: some View {
+    if case .singleAgent = plan {
+      TextField("Model (optional)", text: $model, prompt: Text("Provider default"))
+        .disabled(!isConfiguring)
+        .help(
+          "Leave blank to use the provider default. Enter the model name accepted by this agent."
+        )
+        .accessibilityIdentifier("pensieve.dispatch.model")
+    }
+    Picker("Execution environment", selection: $environment) {
+      Text("Workflow default").tag("")
+      ForEach((capabilities?.environments.keys.sorted() ?? []), id: \.self) { id in
+        if let descriptor = capabilities?.environments[id] {
+          let worktree = id == "local-worktrees"
+          let supported =
+            (id == "local-native" || worktree)
+            && capabilities?.supportsWorktreeOverride(worktree) == true
+          Text(descriptor.label + (supported ? "" : " · unavailable"))
+            .tag(id)
+            .disabled(!supported)
+            .help(descriptor.reason)
+        }
+      }
+    }
+    .disabled(!isConfiguring)
+    .accessibilityIdentifier("pensieve.dispatch.environment")
+    if let optionsError {
+      Text(optionsError)
+        .font(.system(size: 11)).foregroundStyle(.red)
+        .accessibilityIdentifier("pensieve.dispatch.optionsError")
+    }
   }
 
   // MARK: - Agent section (capability-truth driven)
@@ -300,17 +378,20 @@ struct DispatchPopover: View {
             Self.canConfirmDispatch(
               subjectIsEmpty: intent.subjectIsEmpty,
               plan: plan,
-              mcpStatus: mcpStatus)
+              mcpStatus: mcpStatus,
+              optionsSupported: optionsError == nil)
           else { return }
+          let options = dispatchOptions
           phase = .dispatching
-          Task { await runDispatch() }
+          Task { await runDispatch(options: options) }
         }
         .keyboardShortcut(.defaultAction)
         .disabled(
           !Self.canConfirmDispatch(
             subjectIsEmpty: intent.subjectIsEmpty,
             plan: plan,
-            mcpStatus: mcpStatus)
+            mcpStatus: mcpStatus,
+            optionsSupported: optionsError == nil)
         )
         .accessibilityIdentifier("pensieve.dispatch.confirm")
       }
@@ -433,7 +514,7 @@ struct DispatchPopover: View {
       observe: ReceiptActions.Observe(agent: observeAgent, runID: runID))
   }
 
-  private func runDispatch() async {
+  private func runDispatch(options: AgentDispatchOptions) async {
     // phase is already .dispatching (set synchronously by the Dispatch button's
     // re-entry guard) before this Task runs.
     let agents: [String]
@@ -453,7 +534,7 @@ struct DispatchPopover: View {
       return
     }
     let outcome = await controller.confirmDispatch(
-      intent: intent, workflow: workflow, agents: agents, rootURL: rootURL)
+      intent: intent, workflow: workflow, agents: agents, rootURL: rootURL, options: options)
     phase = Self.resolvedPhase(for: outcome)
   }
 
